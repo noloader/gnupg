@@ -94,6 +94,8 @@ map_sw (int sw)
         ec = GPG_ERR_GENERAL; /* Should not happen. */
       else if ((sw & 0xff00) == SW_MORE_DATA)
         ec = 0; /* This should actually never been seen here. */
+      else if ((sw & 0xfff0) == 0x63C0)
+        ec = GPG_ERR_BAD_PIN;
       else
         ec = GPG_ERR_CARD;
     }
@@ -141,6 +143,17 @@ iso7816_select_application_ext (int slot, const char *aid, size_t aidlen,
   sw = apdu_send (slot, 0, 0x00, CMD_SELECT_FILE, 4,
                   (flags&1)? 0:0x0c, aidlen, aid,
                   result, resultlen);
+  return map_sw (sw);
+}
+
+
+/* Simple MF selection as supported by some cards.  */
+gpg_error_t
+iso7816_select_mf (int slot)
+{
+  int sw;
+
+  sw = apdu_send_simple (slot, 0, 0x00, CMD_SELECT_FILE, 0x000, 0x0c, -1, NULL);
   return map_sw (sw);
 }
 
@@ -327,6 +340,39 @@ iso7816_verify (int slot, int chvno, const char *chv, size_t chvlen)
   sw = apdu_send_simple (slot, 0, 0x00, CMD_VERIFY, 0, chvno, chvlen, chv);
   return map_sw (sw);
 }
+
+
+/* Some cards support a VERIFY command variant to check the status of
+ * the the CHV without a need to try a CHV.  In contrast to the other
+ * functions this function returns the special codes ISO7816_VERIFY_*
+ * or a non-negative number with the left attempts.  */
+int
+iso7816_verify_status (int slot, int chvno)
+{
+  unsigned char apdu[4];
+  unsigned int sw;
+  int result;
+
+  apdu[0] = 0x00;
+  apdu[1] = ISO7816_VERIFY;
+  apdu[2] = 0x00;
+  apdu[3] = chvno;
+  if (!iso7816_apdu_direct (slot, apdu, 4, 0, &sw, NULL, NULL))
+    result = ISO7816_VERIFY_NOT_NEEDED;  /* Not returned by all cards.  */
+  else if (sw == 0x6a88 || sw == 0x6a80)
+    result = ISO7816_VERIFY_NO_PIN;
+  else if (sw == 0x6983)
+    result = ISO7816_VERIFY_BLOCKED;
+  else if (sw == 0x6985)
+    result = ISO7816_VERIFY_NULLPIN;     /* TCOS card  */
+  else if ((sw & 0xfff0) == 0x63C0)
+    result = (sw & 0x000f);
+  else
+    result = ISO7816_VERIFY_ERROR;
+
+  return result;
+}
+
 
 /* Perform a CHANGE_REFERENCE_DATA command on SLOT for the card holder
    verification vector CHVNO.  With PININFO non-NULL the pinpad of the

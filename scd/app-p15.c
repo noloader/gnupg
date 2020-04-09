@@ -40,6 +40,7 @@
 #include "scdaemon.h"
 
 #include "iso7816.h"
+#include "../common/i18n.h"
 #include "../common/tlv.h"
 #include "apdu.h" /* fixme: we should move the card detection to a
                      separate file */
@@ -54,6 +55,17 @@ typedef enum
     CARD_TYPE_BELPIC   /* Belgian eID card specs. */
   }
 card_type_t;
+
+/* The OS of card as specified by card_type_t is not always
+ * sufficient.  Thus we also distinguish the actual product build upon
+ * the given OS.  */
+typedef enum
+  {
+    CARD_PRODUCT_UNKNOWN,
+    CARD_PRODUCT_DTRUST    /* D-Trust GmbH (bundesdruckerei.de) */
+  }
+card_product_t;
+
 
 /* A list card types with ATRs noticed with these cards. */
 #define X(a) ((unsigned char const *)(a))
@@ -198,6 +210,14 @@ struct prkdf_object_s
    * modulus).  It is valid if the keygrip is also valid.  */
   unsigned int keynbits;
 
+  /* Malloced CN from the Subject-DN of the corresponding certificate
+   * or NULL if not known.  */
+  char *common_name;
+
+  /* Malloced SerialNumber from the Subject-DN of the corresponding
+   * certificate or NULL if not known.  */
+  char *serial_number;
+
   /* Length and allocated buffer with the Id of this object. */
   size_t objidlen;
   unsigned char *objid;
@@ -305,8 +325,11 @@ struct app_local_s
      hierarchy.  Thus we assume this is directly below the MF.  */
   unsigned short home_df;
 
-  /* The type of the card. */
+  /* The type of the card's OS. */
   card_type_t card_type;
+
+  /* The vendor's product.  */
+  card_product_t card_product;
 
   /* Flag indicating whether we may use direct path selection. */
   int direct_path_selection;
@@ -378,6 +401,8 @@ release_prkdflist (prkdf_object_t a)
   while (a)
     {
       prkdf_object_t tmp = a->next;
+      xfree (a->common_name);
+      xfree (a->serial_number);
       xfree (a->objid);
       xfree (a->authid);
       xfree (a);
@@ -2375,6 +2400,7 @@ read_ef_tokeninfo (app_t app)
 
   xfree (app->app_local->manufacturer_id);
   app->app_local->manufacturer_id = NULL;
+  app->app_local->card_product = CARD_PRODUCT_UNKNOWN;
 
   err = select_and_read_binary (app_get_slot (app), 0x5032, "TokenInfo",
                                 &buffer, &buflen);
@@ -2472,6 +2498,10 @@ read_ef_tokeninfo (app_t app)
     {
       if (opt.verbose)
         log_info ("p15:  label ........: %.*s\n", (int)objlen, p);
+      if (objlen > 15 && !memcmp (p, "D-TRUST Card V3", 15)
+          && app->app_local->card_type == CARD_TYPE_CARDOS_50)
+        app->app_local->card_product = CARD_PRODUCT_DTRUST;
+
       p += objlen;
       n -= objlen;
       /* Get next TLV.  */
@@ -2606,7 +2636,7 @@ send_certinfo (app_t app, ctrl_t ctrl, const char *certtype,
 
 /* Get the keygrip of the private key object PRKDF.  On success the
  * keygrip, the algo and the length are stored in the KEYGRIP,
- * KEYALFO, and KEYNBITS fields of the PRKDF object.  */
+ * KEYALGO, and KEYNBITS fields of the PRKDF object.  */
 static gpg_error_t
 keygrip_from_prkdf (app_t app, prkdf_object_t prkdf)
 {
@@ -2620,6 +2650,11 @@ keygrip_from_prkdf (app_t app, prkdf_object_t prkdf)
   /* Easy if we got a cached version.  */
   if (prkdf->keygrip_valid)
     return 0;
+
+  xfree (prkdf->common_name);
+  prkdf->common_name = NULL;
+  xfree (prkdf->serial_number);
+  prkdf->serial_number = NULL;
 
   /* FIXME: We should check whether a public key directory file and a
      matching public key for PRKDF is available.  This should make
@@ -2659,6 +2694,59 @@ keygrip_from_prkdf (app_t app, prkdf_object_t prkdf)
   xfree (der);
   if (!err)
     err = app_help_get_keygrip_string (cert, prkdf->keygrip, &s_pkey);
+  if (!err)
+    {
+      /* Try to get the CN and the SerialNumber from the certificate;
+       * we use a very simple approach here which should work in many
+       * cases.  Eventually we should add a rfc-2253 parser into
+       * libksba to make it easier to parse such a string.
+       *
+       * First example string:
+       *   "CN=Otto Schily,O=Miniluv,C=DE"
+       * Second example string:
+       *   "2.5.4.5=#445452323030303236333531,2.5.4.4=#4B6F6368,"
+       *   "2.5.4.42=#5765726E6572,CN=Werner Koch,OU=For testing"
+       *   " purposes only!,O=Testorganisation,C=DE"
+       */
+      char *dn = ksba_cert_get_subject (cert, 0);
+      if (dn)
+        {
+          char *p, *pend, *buf;
+
+          p = strstr (dn, "CN=");
+          if (p && (p==dn || p[-1] == ','))
+            {
+              p += 3;
+              if (!(pend = strchr (p, ',')))
+                pend = p + strlen (p);
+              if (pend && pend > p
+                  && (prkdf->common_name = xtrymalloc ((pend - p) + 1)))
+                {
+                  memcpy (prkdf->common_name, p, pend-p);
+                  prkdf->common_name[pend-p] = 0;
+                }
+            }
+          p = strstr (dn, "2.5.4.5=#"); /* OID of the SerialNumber */
+          if (p && (p==dn || p[-1] == ','))
+            {
+              p += 9;
+              if (!(pend = strchr (p, ',')))
+                pend = p + strlen (p);
+              if (pend && pend > p
+                  && (buf = xtrymalloc ((pend - p) + 1)))
+                {
+                  memcpy (buf, p, pend-p);
+                  buf[pend-p] = 0;
+                  if (!hex2str (buf, buf, strlen (buf)+1, NULL))
+                    xfree (buf);  /* Invalid hex encoding.  */
+                  else
+                    prkdf->serial_number = buf;
+                }
+            }
+          ksba_free (dn);
+        }
+    }
+
   ksba_cert_release (cert);
   if (err)
     goto leave;
@@ -3180,14 +3268,119 @@ prepare_verify_pin (app_t app, const char *keyref,
         }
     }
 
-  /* Select the key file.  Note that this may change the security
-   * environment thus we need to do it before PIN verification. */
-  err = select_ef_by_path (app, prkdf->path, prkdf->pathlen);
-  if (err)
-    log_error ("p15: error selecting file for key %s: %s\n",
-               keyref, gpg_strerror (err));
+
+  if (app->app_local->card_product == CARD_PRODUCT_DTRUST)
+    {
+      /* According to our protocol analysis we need to select a
+       * special AID here.  Before that the master file needs to be
+       * selected.  (RID A000000167 is assigned to IBM) */
+      static char const dtrust_aid[] =
+        { 0xA0, 0x00, 0x00, 0x01, 0x67, 0x45, 0x53, 0x49, 0x47, 0x4E };
+
+      err = iso7816_select_mf (app_get_slot (app));
+      if (!err)
+        err = iso7816_select_application (app_get_slot (app),
+                                          dtrust_aid, sizeof dtrust_aid, 0);
+      if (err)
+        log_error ("p15: error selecting D-TRUST's AID for key %s: %s\n",
+                   keyref, gpg_strerror (err));
+    }
+  else
+    {
+      /* Standard case: Select the key file.  Note that this may
+       * change the security environment thus we need to do it before
+       * PIN verification. */
+      err = select_ef_by_path (app, prkdf->path, prkdf->pathlen);
+      if (err)
+        log_error ("p15: error selecting file for key %s: %s\n",
+                   keyref, gpg_strerror (err));
+    }
 
   return err;
+}
+
+
+static int
+any_control_or_space (const char *string)
+{
+  const unsigned char *s;
+
+  for (s = string; *string; string++)
+    if (*s <= 0x20 || *s >= 0x7f)
+      return 1;
+  return 0;
+}
+
+
+/* Return an allocated string to be used as prompt.  Returns NULL on
+ * malloc error.  */
+static char *
+make_pin_prompt (app_t app, int remaining, const char *firstline,
+                 const char *common_name, const char *serial_number)
+{
+  char *serial, *tmpbuf, *result;
+  const char *dispsn;
+
+  /* We prefer the SerialNumber RDN from the Subject-DN but we don't
+   * use it if it features a percent sign (special character in pin
+   * prompts) or has any control character.  */
+  if (serial_number && *serial_number
+      && !strchr (serial_number, '%')
+      && !any_control_or_space (serial_number))
+    {
+      serial = NULL;
+      dispsn = serial_number;
+    }
+  else
+    {
+      serial = app_get_serialno (app);
+      if (!serial)
+        return NULL;  /* Ooops.  */
+      dispsn = serial;
+    }
+
+  /* TRANSLATORS: Put a \x1f right before a colon.  This can be
+   * used by pinentry to nicely align the names and values.  Keep
+   * the %s at the start and end of the string.  */
+  result = xtryasprintf (_("%s"
+                           "Number\x1f: %s%%0A"
+                           "Holder\x1f: %s"
+                           "%s"),
+                         "\x1e",
+                         dispsn,
+                         common_name? common_name: "",
+                         "");
+  if (!result)
+    return NULL; /* Out of core.  */
+  xfree (serial);
+
+  /* Append a "remaining attempts" info if needed.  */
+  if (remaining != -1 && remaining < 3)
+    {
+      char *rembuf;
+
+      /* TRANSLATORS: This is the number of remaining attempts to
+       * enter a PIN.  Use %%0A (double-percent,0A) for a linefeed. */
+      rembuf = xtryasprintf (_("Remaining attempts: %d"), remaining);
+      if (rembuf)
+        {
+          tmpbuf = strconcat (firstline, "%0A%0A", result,
+                              "%0A%0A", rembuf, NULL);
+          xfree (rembuf);
+        }
+      else
+        tmpbuf = NULL;
+      xfree (result);
+      result = tmpbuf;
+    }
+  else
+    {
+      tmpbuf = strconcat (firstline, "%0A%0A", result, NULL);
+      xfree (result);
+      result = tmpbuf;
+    }
+
+  return result;
 }
 
 
@@ -3202,25 +3395,61 @@ verify_pin (app_t app,
   gpg_error_t err;
   char *pinvalue;
   size_t pinvaluelen;
+  const char *label;
   const char *errstr;
   const char *s;
+  int remaining;
+  int pin_reference;
   int i;
 
   if (!aodf)
     return 0;
 
+  pin_reference = aodf->pin_reference_valid? aodf->pin_reference : 0;
+
+  if (app->app_local->card_type == CARD_TYPE_CARDOS_50)
+    {
+      /* We know that this card supports a verify status check.  Note
+       * that in contrast to PIV cards ISO7816_VERIFY_NOT_NEEDED is
+       * not supported.  */
+      remaining = iso7816_verify_status (app_get_slot (app), pin_reference);
+      if (remaining < 0)
+        remaining = -1; /* We don't care about the concrete error.  */
+      if (remaining < 3)
+        {
+          if (remaining >= 0)
+            log_info ("p15: PIN has %d attempts left\n", remaining);
+          /* On error or if less than 3 better ask. */
+          prkdf->pin_verified = 0;
+        }
+    }
+  else
+    remaining = -1;  /* Unknown.  */
+
+  /* Check whether we already verified it.  */
   if (prkdf->pin_verified)
     return 0;  /* Already done.  */
 
   if (prkdf->usageflags.non_repudiation
-      && app->app_local->card_type == CARD_TYPE_BELPIC)
-    err = pincb (pincb_arg, "PIN (qualified signature!)", &pinvalue);
+      && (app->app_local->card_type == CARD_TYPE_BELPIC
+          || app->app_local->card_product == CARD_PRODUCT_DTRUST))
+    label = _("||Please enter the PIN for the key to create "
+              "qualified signatures.");
   else
-    err = pincb (pincb_arg, "PIN", &pinvalue);
+    label = _("||Please enter the PIN for the standard keys.");
+
+  {
+    char *prompt = make_pin_prompt (app, remaining, label,
+                                    prkdf->common_name, prkdf->serial_number);
+    if (!prompt)
+      err = gpg_error_from_syserror ();
+    else
+      err = pincb (pincb_arg, prompt, &pinvalue);
+    xfree (prompt);
+  }
   if (err)
     {
-      log_info ("p15: PIN callback returned error: %s\n",
-                gpg_strerror (err));
+      log_info ("p15: PIN callback returned error: %s\n", gpg_strerror (err));
       return err;
     }
 
@@ -3346,10 +3575,8 @@ verify_pin (app_t app,
     pinvaluelen = strlen (pinvalue);
 
   /* log_printhex (pinvalue, pinvaluelen, */
-  /*               "about to verify with ref %lu pin:", */
-  /*               aodf->pin_reference_valid? aodf->pin_reference : 0); */
-  err = iso7816_verify (app_get_slot (app),
-                        aodf->pin_reference_valid? aodf->pin_reference : 0,
+  /*               "about to verify with ref %lu pin:", pin_reference); */
+  err = iso7816_verify (app_get_slot (app), pin_reference,
                         pinvalue, pinvaluelen);
   xfree (pinvalue);
   if (err)
@@ -3612,9 +3839,6 @@ do_sign (app_t app, ctrl_t ctrl, const char *keyidstr, int hashalgo,
                             exmode, dataptr, datalen,
                             le_value, outdata, outdatalen);
 
-  if (!err)
-    log_printhex (*outdata, *outdatalen, "sign output:");
-
   return err;
 }
 
@@ -3722,9 +3946,29 @@ do_decipher (app_t app, ctrl_t ctrl, const char *keyidstr,
 
 
   /* The next is guess work for CardOS.  */
-  if (prkdf->key_reference_valid)
+  if (app->app_local->card_product == CARD_PRODUCT_DTRUST)
+    {
+      /* From analyzing an USB trace of a Windows signing application
+       * we see that the SE is simply reset to 0x14.  It seems to be
+       * sufficient to do this for decryption; signing still works
+       * with the standard code despite that our trace showed that
+       * there the SE is restored to 0x09.  Note that the special
+       * D-Trust AID is in any case select by prepare_verify_pin.
+       *
+       * Hey, D-Trust please hand over the specs so that you can
+       * actually sell your cards and we can properly implement it;
+       * other vendors understand this and do not demand ridiculous
+       * paper work or complicated procedures to get samples.  */
+      err = iso7816_manage_security_env (app_get_slot (app),
+                                         0xF3, 0x14, NULL, 0);
+
+    }
+  else if (prkdf->key_reference_valid)
     {
       unsigned char mse[6];
+
+      /* Note: This works with CardOS but the D-Trust card has the
+       * problem that the next created signature would be broken.  */
 
       mse[0] = 0x80; /* Algorithm reference.  */
       mse[1] = 1;
@@ -3734,13 +3978,13 @@ do_decipher (app_t app, ctrl_t ctrl, const char *keyidstr,
       mse[5] = prkdf->key_reference;
       err = iso7816_manage_security_env (app_get_slot (app), 0x41, 0xB8,
                                          mse, sizeof mse);
-      if (err)
-        {
-          log_error ("p15: MSE failed: %s\n", gpg_strerror (err));
-          return err;
-        }
     }
-
+  /* Check for MSE error.  */
+  if (err)
+    {
+      log_error ("p15: MSE failed: %s\n", gpg_strerror (err));
+      return err;
+    }
 
   exmode = le_value = 0;
   padind = 0;
@@ -3749,6 +3993,9 @@ do_decipher (app_t app, ctrl_t ctrl, const char *keyidstr,
       exmode = 1;   /* Extended length w/o a limit.  */
       le_value = prkdf->keynbits / 8;
     }
+
+  if (app->app_local->card_product == CARD_PRODUCT_DTRUST)
+    padind = 0x81;
 
   err = iso7816_decipher (app_get_slot (app), exmode,
                           indata, indatalen,
@@ -4009,6 +4256,8 @@ app_select_p15 (app_t app)
       /* Store the card type.  FIXME: We might want to put this into
          the common APP structure. */
       app->app_local->card_type = card_type;
+
+      app->app_local->card_product = CARD_PRODUCT_UNKNOWN;
 
       /* Store whether we may and should use direct path selection. */
       app->app_local->direct_path_selection = direct;
