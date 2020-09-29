@@ -113,7 +113,7 @@ log_printcanon (const char *text, const unsigned char *sexp, size_t sexplen)
 }
 
 
-/* Print the gcryp S-expression in SEXP in advanced format.  With TEXT
+/* Print the gcrypt S-expression SEXP in advanced format.  With TEXT
    of NULL print just the raw S-expression, with TEXT just an empty
    string, print a trailing linefeed, otherwise print an entire debug
    line. */
@@ -199,7 +199,7 @@ make_canon_sexp_pad (gcry_sexp_t sexp, int secure,
 }
 
 /* Return the so called "keygrip" which is the SHA-1 hash of the
-   public key parameters expressed in a way depended on the algorithm.
+   public key parameters expressed in a way dependend on the algorithm.
 
    KEY is expected to be an canonical encoded S-expression with a
    public or private key. KEYLEN is the length of that buffer.
@@ -260,6 +260,96 @@ cmp_simple_canon_sexp (const unsigned char *a_orig,
     if (*a != *b)
       return 1; /* Not the same. */
   return 0;
+}
+
+
+
+/* Helper for cmp_canon_sexp.  */
+static int
+cmp_canon_sexp_def_tcmp (void *ctx, int depth,
+                         const unsigned char *aval, size_t alen,
+                         const unsigned char *bval, size_t blen)
+{
+  (void)ctx;
+  (void)depth;
+
+  if (alen > blen)
+    return 1;
+  else if (alen < blen)
+    return -1;
+  else
+    return memcmp (aval, bval, alen);
+}
+
+
+/* Compare the two canonical encoded s-expressions A with maximum
+ * length ALEN and B with maximum length BLEN.
+ *
+ * Returns 0 if they match.
+ *
+ * If TCMP is NULL, this is not different really different from a
+ * memcmp but does not consider any garbage after the last closing
+ * parentheses.
+ *
+ * If TCMP is not NULL, it is expected to be a function to compare the
+ * values of each token.  TCMP is called for each token while parsing
+ * the s-expressions until TCMP return a non-zero value.  Here the CTX
+ * receives the provided value TCMPCTX, DEPTH is the number of
+ * currently open parentheses and (AVAL,ALEN) and (BVAL,BLEN) the
+ * values of the current token.  TCMP needs to return zero to indicate
+ * that the tokens match.  */
+int
+cmp_canon_sexp (const unsigned char *a, size_t alen,
+                const unsigned char *b, size_t blen,
+                int (*tcmp)(void *ctx, int depth,
+                            const unsigned char *aval, size_t avallen,
+                            const unsigned char *bval, size_t bvallen),
+                void *tcmpctx)
+{
+  const unsigned char *a_buf, *a_tok;
+  const unsigned char *b_buf, *b_tok;
+  size_t a_buflen, a_toklen;
+  size_t b_buflen, b_toklen;
+  int a_depth, b_depth, ret;
+
+  if ((!a && !b) || (!alen && !blen))
+    return 0; /* Both are NULL, they are identical. */
+  if (!a || !b)
+    return !!a - !!b; /* One is NULL, they are not identical. */
+  if (*a != '(' || *b != '(')
+    log_bug ("invalid S-exp in %s\n", __func__);
+
+  if (!tcmp)
+    tcmp = cmp_canon_sexp_def_tcmp;
+
+  a_depth = 0;
+  a_buf = a;
+  a_buflen = alen;
+  b_depth = 0;
+  b_buf = b;
+  b_buflen = blen;
+
+  for (;;)
+    {
+      if (parse_sexp (&a_buf, &a_buflen, &a_depth, &a_tok, &a_toklen))
+        return -1;  /* A is invalid.  */
+      if (parse_sexp (&b_buf, &b_buflen, &b_depth, &b_tok, &b_toklen))
+        return -1;  /* B is invalid.  */
+      if (!a_depth && !b_depth)
+        return 0; /* End of both expressions - they match.  */
+      if (a_depth != b_depth)
+        return a_depth - b_depth; /* Not the same structure   */
+      if (!a_tok && !b_tok)
+        ; /* parens */
+      else if (a_tok && b_tok)
+        {
+          ret = tcmp (tcmpctx, a_depth, a_tok, a_toklen, b_tok, b_toklen);
+          if (ret)
+            return ret;  /* Mismatch */
+        }
+      else /* One has a paren other has not.  */
+        return !!a_tok - !!b_tok;
+    }
 }
 
 
@@ -512,6 +602,94 @@ get_rsa_pk_from_canon_sexp (const unsigned char *keydata, size_t keydatalen,
 }
 
 
+/* Return the public key parameter Q of a public RSA or ECC key
+ * expressed as an canonical encoded S-expression.  */
+gpg_error_t
+get_ecc_q_from_canon_sexp (const unsigned char *keydata, size_t keydatalen,
+                           unsigned char const **r_q, size_t *r_qlen)
+{
+  gpg_error_t err;
+  const unsigned char *buf, *tok;
+  size_t buflen, toklen;
+  int depth, last_depth1, last_depth2;
+  const unsigned char *ecc_q = NULL;
+  size_t ecc_q_len;
+
+  *r_q = NULL;
+  *r_qlen = 0;
+
+  buf = keydata;
+  buflen = keydatalen;
+  depth = 0;
+  if ((err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen)))
+    return err;
+  if ((err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen)))
+    return err;
+  if (!tok || toklen != 10 || memcmp ("public-key", tok, toklen))
+    return gpg_error (GPG_ERR_BAD_PUBKEY);
+  if ((err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen)))
+    return err;
+  if ((err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen)))
+    return err;
+  if (tok && toklen == 3 && !memcmp ("ecc", tok, toklen))
+    ;
+  else if (tok && toklen == 5 && (!memcmp ("ecdsa", tok, toklen)
+                                  || !memcmp ("eddsa", tok, toklen)))
+    ;
+  else
+    return gpg_error (GPG_ERR_WRONG_PUBKEY_ALGO);
+
+  last_depth1 = depth;
+  while (!(err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen))
+         && depth && depth >= last_depth1)
+    {
+      if (tok)
+        return gpg_error (GPG_ERR_UNKNOWN_SEXP);
+      if ((err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen)))
+        return err;
+      if (tok && toklen == 1)
+        {
+          const unsigned char **mpi;
+          size_t *mpi_len;
+
+          switch (*tok)
+            {
+            case 'q': mpi = &ecc_q; mpi_len = &ecc_q_len; break;
+            default:  mpi = NULL;   mpi_len = NULL; break;
+            }
+          if (mpi && *mpi)
+            return gpg_error (GPG_ERR_DUP_VALUE);
+
+          if ((err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen)))
+            return err;
+          if (tok && mpi)
+            {
+              *mpi = tok;
+              *mpi_len = toklen;
+            }
+        }
+
+      /* Skip to the end of the list. */
+      last_depth2 = depth;
+      while (!(err = parse_sexp (&buf, &buflen, &depth, &tok, &toklen))
+             && depth && depth >= last_depth2)
+        ;
+      if (err)
+        return err;
+    }
+
+  if (err)
+    return err;
+
+  if (!ecc_q || !ecc_q_len)
+    return gpg_error (GPG_ERR_BAD_PUBKEY);
+
+  *r_q = ecc_q;
+  *r_qlen = ecc_q_len;
+  return 0;
+}
+
+
 /* Return the algo of a public KEY of SEXP. */
 int
 get_pk_algo_from_key (gcry_sexp_t key)
@@ -536,9 +714,10 @@ get_pk_algo_from_key (gcry_sexp_t key)
   algo = gcry_pk_map_name (algoname);
   if (algo == GCRY_PK_ECC)
     {
-      gcry_sexp_t l1 = gcry_sexp_find_token (list, "flags", 0);
+      gcry_sexp_t l1;
       int i;
 
+      l1 = gcry_sexp_find_token (list, "flags", 0);
       for (i = l1 ? gcry_sexp_length (l1)-1 : 0; i > 0; i--)
 	{
 	  s = gcry_sexp_nth_data (l1, i, &n);
@@ -551,6 +730,12 @@ get_pk_algo_from_key (gcry_sexp_t key)
 	      break;
 	    }
 	}
+      gcry_sexp_release (l1);
+
+      l1 = gcry_sexp_find_token (list, "curve", 0);
+      s = gcry_sexp_nth_data (l1, 1, &n);
+      if (n == 5 && !memcmp (s, "Ed448", 5))
+        algo = GCRY_PK_EDDSA;
       gcry_sexp_release (l1);
     }
 
@@ -642,6 +827,23 @@ pubkey_algo_string (gcry_sexp_t s_pkey, enum gcry_pk_algos *r_algoid)
 }
 
 
+/* Map a pubkey algo id from gcrypt to a string.  This is the same as
+ * gcry_pk_algo_name but makes sure that the ECC algo identifiers are
+ * not all mapped to "ECC".  */
+const char *
+pubkey_algo_to_string (int algo)
+{
+  if (algo == GCRY_PK_ECDSA)
+    return "ECDSA";
+  else if (algo == GCRY_PK_ECDH)
+    return "ECDH";
+  else if (algo == GCRY_PK_EDDSA)
+    return "EdDSA";
+  else
+    return gcry_pk_algo_name (algo);
+}
+
+
 /* Map a hash algo id from gcrypt to a string.  This is the same as
  * gcry_md_algo_name but the returned string is lower case, as
  * expected by libksba and it avoids some overhead.  */
@@ -680,4 +882,20 @@ hash_algo_to_string (int algo)
     if (algo == hashnames[i].algo)
       return hashnames[i].name;
   return "?";
+}
+
+
+/* Map cipher modes to a string.  */
+const char *
+cipher_mode_to_string (int mode)
+{
+  switch (mode)
+    {
+    case GCRY_CIPHER_MODE_CFB: return "CFB";
+    case GCRY_CIPHER_MODE_CBC: return "CBC";
+    case GCRY_CIPHER_MODE_GCM: return "GCM";
+    case GCRY_CIPHER_MODE_OCB: return "OCB";
+    case 14:                   return "EAX";  /* Only in gcrypt 1.9 */
+    default: return "[?]";
+    }
 }

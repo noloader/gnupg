@@ -31,9 +31,10 @@ typedef struct keydb_handle *KEYDB_HANDLE;
 
 
 /*-- keydb.c --*/
+void gpgsm_keydb_deinit_session_data (ctrl_t ctrl);
 gpg_error_t keydb_add_resource (ctrl_t ctrl, const char *url,
                                 int force, int *auto_created);
-KEYDB_HANDLE keydb_new (void);
+KEYDB_HANDLE keydb_new (ctrl_t ctrl);
 void keydb_release (KEYDB_HANDLE hd);
 int keydb_set_ephemeral (KEYDB_HANDLE hd, int yes);
 const char *keydb_get_resource_name (KEYDB_HANDLE hd);
@@ -51,11 +52,10 @@ gpg_error_t keydb_update_cert (KEYDB_HANDLE hd, ksba_cert_t cert);
 
 gpg_error_t keydb_delete (KEYDB_HANDLE hd);
 
-int keydb_locate_writable (KEYDB_HANDLE hd, const char *reserved);
 void keydb_rebuild_caches (void);
 
 gpg_error_t keydb_search_reset (KEYDB_HANDLE hd);
-int keydb_search (ctrl_t ctrl, KEYDB_HANDLE hd,
+gpg_error_t keydb_search (ctrl_t ctrl, KEYDB_HANDLE hd,
                   KEYDB_SEARCH_DESC *desc, size_t ndesc);
 int keydb_search_first (ctrl_t ctrl, KEYDB_HANDLE hd);
 int keydb_search_next (ctrl_t ctrl, KEYDB_HANDLE hd);

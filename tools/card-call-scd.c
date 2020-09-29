@@ -161,6 +161,11 @@ release_card_info (card_info_t info)
       info->kinfo = kinfo;
     }
   info->chvusage[0] = info->chvusage[1] = 0;
+  for (i=0; i < DIM(info->supported_keyalgo); i++)
+    {
+      free_strlist (info->supported_keyalgo[i]);
+      info->supported_keyalgo[i] = NULL;
+    }
 }
 
 
@@ -268,41 +273,9 @@ default_inq_cb (void *opaque, const char *line)
 static gpg_error_t
 warn_version_mismatch (assuan_context_t ctx, const char *servername, int mode)
 {
-  gpg_error_t err;
-  char *serverversion;
-  const char *myversion = gpgrt_strusage (13);
-
-  err = get_assuan_server_version (ctx, mode, &serverversion);
-  if (err)
-    log_log (gpg_err_code (err) == GPG_ERR_NOT_SUPPORTED?
-             GPGRT_LOGLVL_INFO : GPGRT_LOGLVL_ERROR,
-             _("error getting version from '%s': %s\n"),
-             servername, gpg_strerror (err));
-  else if (compare_version_strings (serverversion, myversion) < 0)
-    {
-      char *warn;
-
-      warn = xtryasprintf (_("server '%s' is older than us (%s < %s)"),
-                           servername, serverversion, myversion);
-      if (!warn)
-        err = gpg_error_from_syserror ();
-      else
-        {
-          log_info (_("WARNING: %s\n"), warn);
-          if (!opt.quiet)
-            {
-              log_info (_("Note: Outdated servers may lack important"
-                          " security fixes.\n"));
-              log_info (_("Note: Use the command \"%s\" to restart them.\n"),
-                        "gpgconf --kill all");
-            }
-          gnupg_status_printf (STATUS_WARNING, "server_version_mismatch 0 %s",
-                               warn);
-          xfree (warn);
-        }
-    }
-  xfree (serverversion);
-  return err;
+  return warn_server_version_mismatch (ctx, servername, mode,
+                                       gnupg_status_strings, NULL,
+                                       !opt.quiet);
 }
 
 
@@ -450,10 +423,11 @@ store_serialno (const char *line)
  * stored at R_SW inless R_SW is NULL.  With HEXAPDU being NULL only a
  * RESET command is send to scd.  With HEXAPDU being the string
  * "undefined" the command "SERIALNO undefined" is send to scd.  If
- * R_DATA is not NULL the data is without the status code is stored
- * there.  Caller must release it.  */
+ * R_DATA is not NULL the data without the status code is stored
+ * there.  Caller must release it.  If OPTIONS is not NULL, this will
+ * be passed verbatim to the SCDaemon's APDU command.  */
 gpg_error_t
-scd_apdu (const char *hexapdu, unsigned int *r_sw,
+scd_apdu (const char *hexapdu, const char *options, unsigned int *r_sw,
           unsigned char **r_data, size_t *r_datalen)
 {
   gpg_error_t err;
@@ -484,10 +458,15 @@ scd_apdu (const char *hexapdu, unsigned int *r_sw,
       membuf_t mb;
       unsigned char *data;
       size_t datalen;
+      int no_sw;
 
       init_membuf (&mb, 256);
 
-      snprintf (line, DIM(line), "SCD APDU %s", hexapdu);
+      no_sw = (options && (strstr (options, "--dump-atr")
+                           || strstr (options, "--data-atr")));
+
+      snprintf (line, DIM(line), "SCD APDU %s%s%s",
+                options?options:"", options?" -- ":"", hexapdu);
       err = assuan_transact (agent_ctx, line,
                              put_membuf_cb, &mb, NULL, NULL, NULL, NULL);
       if (!err)
@@ -495,16 +474,16 @@ scd_apdu (const char *hexapdu, unsigned int *r_sw,
           data = get_membuf (&mb, &datalen);
           if (!data)
             err = gpg_error_from_syserror ();
-          else if (datalen < 2) /* Ooops */
+          else if (datalen < (no_sw?1:2)) /* Ooops */
             err = gpg_error (GPG_ERR_CARD);
           else
             {
               if (r_sw)
-                *r_sw = buf16_to_uint (data+datalen-2);
+                *r_sw = no_sw? 0 : buf16_to_uint (data+datalen-2);
               if (r_data && r_datalen)
                 {
                   *r_data = data;
-                  *r_datalen = datalen - 2;
+                  *r_datalen = datalen - (no_sw?0:2);
                   data = NULL;
                 }
             }
@@ -677,7 +656,10 @@ learn_status_cb (void *opaque, const char *line)
 
           log_assert (no >= 0 && no <= 2);
           data = unescape_status_string (line);
-          parm->uif[no] = (data[0] != 0xff);
+          /* I am not sure why we test for 0xff but we better keep
+           * that in case of bogus card versions which did not
+           * initialize that DO correctly.  */
+          parm->uif[no] = (data[0] == 0xff)? 0 : data[0];
           xfree (data);
         }
       break;
@@ -692,6 +674,7 @@ learn_status_cb (void *opaque, const char *line)
         {
           char *p, *p2, *buf;
           int abool;
+          unsigned long number;
 
           buf = p = unescape_status_string (line);
           if (buf)
@@ -713,6 +696,39 @@ learn_status_cb (void *opaque, const char *line)
                         parm->extcap.kdf = abool;
                       else if (!strcmp (p, "si"))
                         parm->status_indicator = strtoul (p2, NULL, 10);
+                      else if (!strcmp (p, "pd"))
+                        parm->extcap.private_dos = abool;
+                      else if (!strcmp (p, "mcl3"))
+                        parm->extcap.mcl3 = strtoul (p2, NULL, 10);
+                      else if (!strcmp (p, "sm"))
+                        {
+                          /* Unfortunately this uses OpenPGP algorithm
+                           * ids so that we need to map them to Gcrypt
+                           * ids.  The mapping is limited to what
+                           * OpenPGP cards support.  Other cards
+                           * should use a different tag than "sm". */
+                          parm->extcap.sm = 1;
+                          number = strtoul (p2, NULL, 10);
+                          switch (number)
+                            {
+                            case CIPHER_ALGO_3DES:
+                              parm->extcap.smalgo = GCRY_CIPHER_3DES;
+                              break;
+                            case CIPHER_ALGO_AES:
+                              parm->extcap.smalgo = GCRY_CIPHER_AES;
+                              break;
+                            case CIPHER_ALGO_AES192:
+                              parm->extcap.smalgo = GCRY_CIPHER_AES192;
+                              break;
+                            case CIPHER_ALGO_AES256:
+                              parm->extcap.smalgo = GCRY_CIPHER_AES256;
+                              break;
+                            default:
+                              /* Unknown algorithm; dont claim SM support.  */
+                              parm->extcap.sm = 0;
+                              break;
+                            }
+                        }
                     }
                 }
               xfree (buf);
@@ -913,7 +929,7 @@ learn_status_cb (void *opaque, const char *line)
                     p++;
                 }
             }
-          else if (parm->apptype == APP_TYPE_PIV)
+          else
             {
               for (i=0; *p && i < DIM (parm->chvinfo); i++)
                 {
@@ -946,7 +962,7 @@ learn_status_cb (void *opaque, const char *line)
           /* The format of such a line is:
            *   KEYPAIRINFO <hexgrip> <keyref> [usage] [keytime]
            */
-          char *fields[4];
+          const char *fields[4];
           int nfields;
           const char *hexgrp, *usage;
           time_t keytime;
@@ -1030,6 +1046,26 @@ learn_status_cb (void *opaque, const char *line)
         {
           xfree (parm->dispserialno);
           parm->dispserialno = unescape_status_string (line);
+        }
+      else if (!memcmp (keyword, "KEY-ATTR-INFO", keywordlen))
+        {
+          if (!strncmp (line, "OPENPGP.", 8))
+            {
+              int no;
+
+              line += 8;
+              no = atoi (line);
+              if (no >= 1 && no <= 3)
+                {
+                  no--;
+                  line++;
+                  while (spacep (line))
+                    line++;
+                  append_to_strlist (&parm->supported_keyalgo[no],
+                                     xstrdup (line));
+                }
+            }
+          /* Skip when it's not "OPENPGP.[123]".  */
         }
       break;
 
@@ -1547,17 +1583,10 @@ scd_applist (strlist_t *result, int all)
 
 
 
-/* Change the PIN of an OpenPGP card or reset the retry counter.
- * CHVNO 1: Change the PIN
- *       2: For v1 cards: Same as 1.
- *          For v2 cards: Reset the PIN using the Reset Code.
- *       3: Change the admin PIN
- *     101: Set a new PIN and reset the retry counter
- *     102: For v1 cars: Same as 101.
- *          For v2 cards: Set a new Reset Code.
- */
+/* Change the PIN of a card or reset the retry counter.  If NULLPIN is
+ * set the TCOS specific NullPIN is changed.  */
 gpg_error_t
-scd_change_pin (const char *pinref, int reset_mode)
+scd_change_pin (const char *pinref, int reset_mode, int nullpin)
 {
   gpg_error_t err;
   char line[ASSUAN_LINELENGTH];
@@ -1571,7 +1600,7 @@ scd_change_pin (const char *pinref, int reset_mode)
   dfltparm.ctx = agent_ctx;
 
   snprintf (line, sizeof line, "SCD PASSWD%s %s",
-            reset_mode? " --reset":"", pinref);
+            nullpin? " --nullpin": reset_mode? " --reset":"", pinref);
   err = assuan_transact (agent_ctx, line,
                          NULL, NULL,
                          default_inq_cb, &dfltparm,

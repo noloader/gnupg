@@ -22,6 +22,7 @@
 #define GNUPG_GPG_CARD_H
 
 #include "../common/session-env.h"
+#include "../common/strlist.h"
 
 
 /* We keep all global options in the structure OPT.  */
@@ -39,6 +40,8 @@ struct
   int autostart;
 
   int no_key_lookup;  /* Assume --no-key-lookup for "list".  */
+
+  int no_history;     /* Do not use the command line history.  */
 
   /* Options passed to the gpg-agent: */
   session_env_t session_env;
@@ -138,6 +141,8 @@ typedef struct key_info_s *key_info_t;
 struct card_info_s
 {
   int initialized;   /* True if a learn command was successful. */
+  int need_sn_cmd;   /* The SERIALNO command needs to be issued.  */
+  int card_removed;  /* Helper flag set by some listing functions.  */
   int error;         /* private. */
   char *reader;      /* Reader information.  */
   char *cardtype;    /* NULL or type of the card.  */
@@ -167,18 +172,24 @@ struct card_info_s
                         required for each signing.  Note that the
                         gpg-agent might cache it anyway. */
   int is_v2;         /* True if this is a v2 openpgp card.  */
-  int chvmaxlen[3];  /* Maximum allowed length of a CHV. */
-  int chvinfo[3];    /* Allowed retries for the CHV; 0 = blocked. */
+  int chvmaxlen[4];  /* Maximum allowed length of a CHV. */
+  int chvinfo[4];    /* Allowed retries for the CHV; 0 = blocked. */
   unsigned char chvusage[2]; /* Data object 5F2F */
   struct {
     unsigned int ki:1;     /* Key import available.  */
     unsigned int aac:1;    /* Algorithm attributes are changeable.  */
     unsigned int kdf:1;    /* KDF object to support PIN hashing available.  */
-    unsigned int bt:1;     /* Button for confirmation available.  */
+    unsigned int bt:1;     /* Button for confirmation available.     */
+    unsigned int sm:1;     /* Secure messaging available.            */
+    unsigned int smalgo:15;/* Secure messaging cipher algorithm.     */
+    unsigned int private_dos:1;/* Support fpr private use DOs.       */
+    unsigned int mcl3:16;  /* Max. length for a OpenPGP card cert.3  */
   } extcap;
   unsigned int status_indicator;
   int kdf_do_enabled;      /* True if card has a KDF object.  */
-  int uif[3];              /* True if User Interaction Flag is on.  */
+  int uif[3];              /* True if User Interaction Flag is on.   */
+                           /* 1 = on, 2 = permanent on.              */
+  strlist_t supported_keyalgo[3];
 };
 typedef struct card_info_s *card_info_t;
 
@@ -189,6 +200,7 @@ void flush_keyblock_cache (void);
 gpg_error_t get_matching_keys (const unsigned char *keygrip, int protocol,
                                keyblock_t *r_keyblock);
 gpg_error_t test_get_matching_keys (const char *hexgrip);
+gpg_error_t get_minimal_openpgp_key (estream_t *r_key, const char *fingerprint);
 
 
 /*-- card-misc.c --*/
@@ -202,7 +214,8 @@ gpg_error_t send_apdu (const char *hexapdu, const char *desc,
 void release_card_info (card_info_t info);
 const char *app_type_string (app_type_t app_type);
 
-gpg_error_t scd_apdu (const char *hexapdu, unsigned int *r_sw,
+gpg_error_t scd_apdu (const char *hexapdu, const char *options,
+                      unsigned int *r_sw,
                       unsigned char **r_data, size_t *r_datalen);
 
 gpg_error_t scd_switchcard (const char *serialno);
@@ -224,14 +237,14 @@ gpg_error_t scd_readcert (const char *certidstr,
 gpg_error_t scd_readkey (const char *keyrefstr, gcry_sexp_t *r_result);
 gpg_error_t scd_cardlist (strlist_t *result);
 gpg_error_t scd_applist (strlist_t *result, int all);
-gpg_error_t scd_change_pin (const char *pinref, int reset_mode);
+gpg_error_t scd_change_pin (const char *pinref, int reset_mode, int nullpin);
 gpg_error_t scd_checkpin (const char *serialno);
 
 unsigned long agent_get_s2k_count (void);
 
 /*-- card-yubikey.c --*/
 gpg_error_t yubikey_commands (card_info_t info,
-                              estream_t fp, int argc, char *argv[]);
+                              estream_t fp, int argc, const char *argv[]);
 
 
 #endif /*GNUPG_GPG_CARD_H*/

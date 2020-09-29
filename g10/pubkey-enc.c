@@ -91,12 +91,9 @@ get_session_key (ctrl_t ctrl, struct pubkey_enc_list *list, DEK *dek)
       if (err)
         break;
 
-      if (!(sk->pubkey_usage & PUBKEY_USAGE_ENC))
-        continue;
-
       /* Check compliance.  */
       if (! gnupg_pk_is_allowed (opt.compliance, PK_USE_DECRYPTION,
-                                 sk->pubkey_algo,
+                                 sk->pubkey_algo, 0,
                                  sk->pkey, nbits_from_pk (sk), NULL))
         {
           log_info (_("key %s is not suitable for decryption"
@@ -144,7 +141,10 @@ get_session_key (ctrl_t ctrl, struct pubkey_enc_list *list, DEK *dek)
             }
           else if (opt.try_all_secrets
                    || (k->keyid[0] == keyid[0] && k->keyid[1] == keyid[1]))
-            ;
+            {
+              if (!opt.quiet && !(sk->pubkey_usage & PUBKEY_USAGE_ENC))
+                log_info (_("used key is not marked for encryption use.\n"));
+            }
           else
             continue;
 
@@ -153,7 +153,12 @@ get_session_key (ctrl_t ctrl, struct pubkey_enc_list *list, DEK *dek)
           if (!err)
             {
               if (!opt.quiet && !k->keyid[0] && !k->keyid[1])
-                log_info (_("okay, we are the anonymous recipient.\n"));
+                {
+                  log_info (_("okay, we are the anonymous recipient.\n"));
+                  if (!(sk->pubkey_usage & PUBKEY_USAGE_ENC))
+                    log_info (_("used key is not marked for encryption use.\n")
+                              );
+                }
               search_for_secret_keys = 0;
               break;
             }
@@ -278,20 +283,11 @@ get_it (ctrl_t ctrl,
 
   if (sk->pubkey_algo == PUBKEY_ALGO_ECDH)
     {
-      gcry_mpi_t shared_mpi;
       gcry_mpi_t decoded;
 
       /* At the beginning the frame are the bytes of shared point MPI.  */
-      err = gcry_mpi_scan (&shared_mpi, GCRYMPI_FMT_USG, frame, nframe, NULL);
-      if (err)
-        {
-          err = gpg_error (GPG_ERR_WRONG_SECKEY);
-          goto leave;
-        }
-
       err = pk_ecdh_decrypt (&decoded, fp, enc->data[1]/*encr data as an MPI*/,
-                             shared_mpi, sk->pkey);
-      mpi_release (shared_mpi);
+                             frame, nframe, sk->pkey);
       if(err)
         goto leave;
 

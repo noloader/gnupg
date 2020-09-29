@@ -319,19 +319,11 @@ encrypt_simple (const char *filename, int mode, int use_seskey)
   cfx.dek = NULL;
   if ( mode )
     {
-      int canceled;
       aead_algo_t aead_algo;
 
-      s2k = xmalloc_clear( sizeof *s2k );
-      s2k->mode = opt.s2k_mode;
-      s2k->hash_algo = S2K_DIGEST_ALGO;
-      cfx.dek = passphrase_to_dek (default_cipher_algo (), s2k, 1, 0,
-                                   NULL, &canceled);
-      if ( !cfx.dek || !cfx.dek->keylen )
+      rc = setup_symkey (&s2k, &cfx.dek);
+      if (rc)
         {
-          rc = gpg_error (canceled? GPG_ERR_CANCELED:GPG_ERR_INV_PASSPHRASE);
-          xfree (cfx.dek);
-          xfree (s2k);
           iobuf_close (inp);
           log_error (_("error creating passphrase: %s\n"), gpg_strerror (rc));
           release_progress_context (pfx);
@@ -534,22 +526,22 @@ encrypt_simple (const char *filename, int mode, int use_seskey)
 }
 
 
-int
-setup_symkey (STRING2KEY **symkey_s2k,DEK **symkey_dek)
+gpg_error_t
+setup_symkey (STRING2KEY **symkey_s2k, DEK **symkey_dek)
 {
   int canceled;
 
-  *symkey_s2k=xmalloc_clear(sizeof(STRING2KEY));
+  *symkey_s2k = xmalloc_clear (sizeof **symkey_s2k);
   (*symkey_s2k)->mode = opt.s2k_mode;
   (*symkey_s2k)->hash_algo = S2K_DIGEST_ALGO;
 
-  *symkey_dek = passphrase_to_dek (opt.s2k_cipher_algo,
+  *symkey_dek = passphrase_to_dek (default_cipher_algo (),
                                    *symkey_s2k, 1, 0, NULL, &canceled);
-  if(!*symkey_dek || !(*symkey_dek)->keylen)
+  if (!*symkey_dek || !(*symkey_dek)->keylen)
     {
       xfree(*symkey_dek);
       xfree(*symkey_s2k);
-      return gpg_error (canceled?GPG_ERR_CANCELED:GPG_ERR_BAD_PASSPHRASE);
+      return gpg_error (canceled?GPG_ERR_CANCELED:GPG_ERR_INV_PASSPHRASE);
     }
 
   return 0;
@@ -785,15 +777,15 @@ encrypt_crypt (ctrl_t ctrl, int filefd, const char *filename,
         PKT_public_key *pk = pkr->pk;
         unsigned int nbits = nbits_from_pk (pk);
 
-        if (!gnupg_pk_is_compliant (opt.compliance,
-                                    pk->pubkey_algo, pk->pkey, nbits, NULL))
+        if (!gnupg_pk_is_compliant (opt.compliance, pk->pubkey_algo, 0,
+                                    pk->pkey, nbits, NULL))
           log_info (_("WARNING: key %s is not suitable for encryption"
                       " in %s mode\n"),
                     keystr_from_pk (pk),
                     gnupg_compliance_option_string (opt.compliance));
 
         if (compliant
-            && !gnupg_pk_is_compliant (CO_DE_VS, pk->pubkey_algo, pk->pkey,
+            && !gnupg_pk_is_compliant (CO_DE_VS, pk->pubkey_algo, 0, pk->pkey,
                                        nbits, NULL))
           compliant = 0;
       }

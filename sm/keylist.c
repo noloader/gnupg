@@ -25,7 +25,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
-#include <assert.h>
 
 #include "gpgsm.h"
 
@@ -395,7 +394,10 @@ print_compliance_flags (ksba_cert_t cert, int algo, unsigned int nbits,
   int indent = 0;
   int hashalgo;
 
-  if (gnupg_pk_is_compliant (CO_DE_VS, algo, NULL, nbits, NULL))
+  /* Note that we do not need to test for PK_ALGO_FLAG_RSAPSS because
+   * that is not a property of the key but one of the created
+   * signature.  */
+  if (gnupg_pk_is_compliant (CO_DE_VS, algo, 0, NULL, nbits, NULL))
     {
       hashalgo = gcry_md_map_name (ksba_cert_get_digest_algo (cert));
       if (gnupg_digest_is_compliant (CO_DE_VS, hashalgo))
@@ -425,6 +427,7 @@ list_cert_colon (ctrl_t ctrl, ksba_cert_t cert, unsigned int validity,
   gpg_error_t valerr;
   int algo;
   unsigned int nbits;
+  char *curve = NULL;
   const char *chain_id;
   char *chain_id_buffer = NULL;
   int is_root = 0;
@@ -449,8 +452,9 @@ list_cert_colon (ctrl_t ctrl, ksba_cert_t cert, unsigned int validity,
         chain_id = chain_id_buffer;
         ksba_cert_release (next);
       }
-    else if (rc == -1)  /* We have reached the root certificate. */
+    else if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
       {
+        /* We have reached the root certificate. */
         chain_id = fpr;
         is_root = 1;
       }
@@ -516,7 +520,7 @@ list_cert_colon (ctrl_t ctrl, ksba_cert_t cert, unsigned int validity,
   if (*truststring)
     es_fputs (truststring, fp);
 
-  algo = gpgsm_get_key_algo_info (cert, &nbits);
+  algo = gpgsm_get_key_algo_info2 (cert, &nbits, &curve);
   es_fprintf (fp, ":%u:%d:%s:", nbits, algo, fpr+24);
 
   ksba_cert_get_validity (cert, 0, t);
@@ -580,6 +584,8 @@ list_cert_colon (ctrl_t ctrl, ksba_cert_t cert, unsigned int validity,
     }
   es_putc (':', fp);  /* End of field 15. */
   es_putc (':', fp);  /* End of field 16. */
+  if (curve)
+    es_fputs (curve, fp);
   es_putc (':', fp);  /* End of field 17. */
   print_compliance_flags (cert, algo, nbits, fp);
   es_putc (':', fp);  /* End of field 18. */
@@ -594,6 +600,10 @@ list_cert_colon (ctrl_t ctrl, ksba_cert_t cert, unsigned int validity,
   es_putc ('\n', fp);
   xfree (fpr); fpr = NULL; chain_id = NULL;
   xfree (chain_id_buffer); chain_id_buffer = NULL;
+  /* SHA256 FPR record */
+  fpr = gpgsm_get_fingerprint_hexstring (cert, GCRY_MD_SHA256);
+  es_fprintf (fp, "fp2:::::::::%s::::\n", fpr);
+  xfree (fpr); fpr = NULL;
 
   /* Always print the keygrip.  */
   if ( (p = gpgsm_get_keygrip_hexstring (cert)))
@@ -639,6 +649,7 @@ list_cert_colon (ctrl_t ctrl, ksba_cert_t cert, unsigned int validity,
       xfree (p);
     }
   xfree (kludge_uid);
+  xfree (curve);
 }
 
 
@@ -776,8 +787,11 @@ list_cert_raw (ctrl_t ctrl, KEYDB_HANDLE hd,
   sexp = ksba_cert_get_serial (cert);
   es_fputs ("          S/N: ", fp);
   gpgsm_print_serial (fp, sexp);
-  ksba_free (sexp);
   es_putc ('\n', fp);
+  es_fputs ("        (dec): ", fp);
+  gpgsm_print_serial_decimal (fp, sexp);
+  es_putc ('\n', fp);
+  ksba_free (sexp);
 
   dn = ksba_cert_get_issuer (cert, 0);
   es_fputs ("       Issuer: ", fp);
@@ -804,6 +818,10 @@ list_cert_raw (ctrl_t ctrl, KEYDB_HANDLE hd,
       ksba_free (dn);
       es_putc ('\n', fp);
     }
+
+  dn = gpgsm_get_fingerprint_string (cert, GCRY_MD_SHA256);
+  es_fprintf (fp, "     sha2_fpr: %s\n", dn?dn:"error");
+  xfree (dn);
 
   dn = gpgsm_get_fingerprint_string (cert, 0);
   es_fprintf (fp, "     sha1_fpr: %s\n", dn?dn:"error");
@@ -835,12 +853,11 @@ list_cert_raw (ctrl_t ctrl, KEYDB_HANDLE hd,
   es_fprintf (fp, "     hashAlgo: %s%s%s%s\n", oid, s?" (":"",s?s:"",s?")":"");
 
   {
-    const char *algoname;
-    unsigned int nbits;
+    char *algostr;
 
-    algoname = gcry_pk_algo_name (gpgsm_get_key_algo_info (cert, &nbits));
-    es_fprintf (fp, "      keyType: %u bit %s\n",
-                nbits, algoname? algoname:"?");
+    algostr = gpgsm_pubkey_algo_string (cert, NULL);
+    es_fprintf (fp, "      keyType: %s\n", algostr? algostr : "[error]");
+    xfree (algostr);
   }
 
   /* subjectKeyIdentifier */
@@ -1156,8 +1173,11 @@ list_cert_std (ctrl_t ctrl, ksba_cert_t cert, estream_t fp, int have_secret,
   sexp = ksba_cert_get_serial (cert);
   es_fputs ("          S/N: ", fp);
   gpgsm_print_serial (fp, sexp);
-  ksba_free (sexp);
   es_putc ('\n', fp);
+  es_fputs ("        (dec): ", fp);
+  gpgsm_print_serial_decimal (fp, sexp);
+  es_putc ('\n', fp);
+  ksba_free (sexp);
 
   dn = ksba_cert_get_issuer (cert, 0);
   es_fputs ("       Issuer: ", fp);
@@ -1195,14 +1215,12 @@ list_cert_std (ctrl_t ctrl, ksba_cert_t cert, estream_t fp, int have_secret,
 
 
   {
-    const char *algoname;
-    unsigned int nbits;
+    char *algostr;
 
-    algoname = gcry_pk_algo_name (gpgsm_get_key_algo_info (cert, &nbits));
-    es_fprintf (fp, "     key type: %u bit %s\n",
-                nbits, algoname? algoname:"?");
+    algostr = gpgsm_pubkey_algo_string (cert, NULL);
+    es_fprintf (fp, "     key type: %s\n", algostr? algostr : "[error]");
+    xfree (algostr);
   }
-
 
   err = ksba_cert_get_key_usage (cert, &kusage);
   if (gpg_err_code (err) != GPG_ERR_NO_DATA)
@@ -1272,7 +1290,7 @@ list_cert_std (ctrl_t ctrl, ksba_cert_t cert, estream_t fp, int have_secret,
         {
           if (!cert_der)
             cert_der = ksba_cert_get_image (cert, NULL);
-          assert (cert_der);
+          log_assert (cert_der);
           es_fputs ("  restriction: ", fp);
           print_utf8_extn (fp, 15, cert_der+off, len);
         }
@@ -1321,7 +1339,11 @@ list_cert_std (ctrl_t ctrl, ksba_cert_t cert, estream_t fp, int have_secret,
     }
 
   dn = gpgsm_get_fingerprint_string (cert, 0);
-  es_fprintf (fp, "  fingerprint: %s\n", dn?dn:"error");
+  es_fprintf (fp, "     sha1 fpr: %s\n", dn?dn:"error");
+  xfree (dn);
+
+  dn = gpgsm_get_fingerprint_string (cert, GCRY_MD_SHA256);
+  es_fprintf (fp, "     sha2 fpr: %s\n", dn?dn:"error");
   xfree (dn);
 
   if (opt.with_keygrip)
@@ -1427,7 +1449,7 @@ list_internal_keys (ctrl_t ctrl, strlist_t names, estream_t fp,
   int have_secret;
   int want_ephemeral = ctrl->with_ephemeral_keys;
 
-  hd = keydb_new ();
+  hd = keydb_new (ctrl);
   if (!hd)
     {
       log_error ("keydb_new failed\n");
@@ -1582,7 +1604,7 @@ list_internal_keys (ctrl_t ctrl, strlist_t names, estream_t fp,
       lastcert = cert;
       cert = NULL;
     }
-  if (gpg_err_code (rc) == GPG_ERR_EOF || rc == -1 )
+  if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
     rc = 0;
   if (rc)
     log_error ("keydb_search failed: %s\n", gpg_strerror (rc));
@@ -1648,7 +1670,7 @@ list_external_keys (ctrl_t ctrl, strlist_t names, estream_t fp, int raw_mode)
   parm.with_chain = ctrl->with_chain;
   parm.raw_mode  = raw_mode;
 
-  rc = gpgsm_dirmngr_lookup (ctrl, names, 0, list_external_cb, &parm);
+  rc = gpgsm_dirmngr_lookup (ctrl, names, NULL, 0, list_external_cb, &parm);
   if (gpg_err_code (rc) == GPG_ERR_EOF || rc == -1
       || gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
     rc = 0; /* "Not found" is not an error here. */

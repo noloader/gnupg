@@ -61,7 +61,8 @@ struct dev_list {
   int idx_max;
 };
 
-#define MAX_READER 4 /* Number of readers we support concurrently. */
+#define MAX_READER 16 /* Number of readers we support concurrently. */
+                      /* See also MAX_DEVICE in ccid-driver.c.  */
 
 
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -129,7 +130,6 @@ struct reader_table_s {
 #endif /*USE_G10CODE_RAPDU*/
   char *rdrname;     /* Name of the connected reader or NULL if unknown. */
   unsigned int is_t0:1;     /* True if we know that we are running T=0. */
-  unsigned int is_spr532:1; /* True if we know that the reader is a SPR532.  */
   unsigned int pinpad_varlen_supported:1;  /* True if we know that the reader
                                               supports variable length pinpad
                                               input.  */
@@ -363,8 +363,22 @@ static int pcsc_pinpad_modify (int slot, int class, int ins, int p0, int p1,
 
 
 /*
-      Helper
+ *    Helper
  */
+
+/* Return true if (BUFFER,LENGTH) consists of only binary zeroes.  */
+static int
+all_zero_p (const void *buffer, size_t length)
+{
+  const unsigned char *p;
+
+  for (p=buffer; length; p++, length--)
+    if (*p)
+      return 0;
+  return 1;
+}
+
+
 
 static int
 lock_slot (int slot)
@@ -455,7 +469,6 @@ new_reader_slot (void)
   reader_table[reader].pinpad_modify = pcsc_pinpad_modify;
 
   reader_table[reader].is_t0 = 1;
-  reader_table[reader].is_spr532 = 0;
   reader_table[reader].pinpad_varlen_supported = 0;
   reader_table[reader].require_get_status = 1;
   reader_table[reader].pcsc.verify_ioctl = 0;
@@ -507,6 +520,13 @@ host_sw_string (long err)
     case SW_HOST_NO_PINPAD: return "no pinpad";
     case SW_HOST_ALREADY_CONNECTED: return "already connected";
     case SW_HOST_CANCELLED: return "cancelled";
+    case SW_HOST_USB_OTHER:    return "USB general error";
+    case SW_HOST_USB_IO:       return "USB I/O error";
+    case SW_HOST_USB_ACCESS:   return "USB permission denied";
+    case SW_HOST_USB_NO_DEVICE:return "USB no device";
+    case SW_HOST_USB_BUSY:     return "USB busy";
+    case SW_HOST_USB_TIMEOUT:  return "USB timeout";
+    case SW_HOST_USB_OVERFLOW: return "USB overflow";
     default: return "unknown host status error";
     }
 }
@@ -799,7 +819,7 @@ static int
 close_pcsc_reader (int slot)
 {
   (void)slot;
-  if (--pcsc.count == 0)
+  if (--pcsc.count == 0 && npth_mutex_trylock (&reader_table_lock) == 0)
     {
       int i;
 
@@ -807,6 +827,7 @@ close_pcsc_reader (int slot)
       pcsc.context = 0;
       for (i = 0; i < MAX_READER; i++)
         pcsc.rdrname[i] = NULL;
+      npth_mutex_unlock (&reader_table_lock);
     }
   return 0;
 }
@@ -968,7 +989,16 @@ pcsc_vendor_specific_init (int slot)
         {
           if (strstr (reader_table[slot].rdrname, "SPRx32"))
             {
-              reader_table[slot].is_spr532 = 1;
+              const unsigned char cmd[] = { '\x80', '\x02', '\x00' };
+              sw = control_pcsc (slot, CM_IOCTL_VENDOR_IFD_EXCHANGE,
+                                 cmd, sizeof (cmd), NULL, 0);
+
+              /* Even though it's control at IFD level (request to the
+               * reader, not card), it returns an error when card is
+               * not active.  Just ignore the error.
+               */
+              if (sw)
+                log_debug ("Ignore control_pcsc failure.\n");
               reader_table[slot].pinpad_varlen_supported = 1;
             }
           else if (strstr (reader_table[slot].rdrname, "ST-2xxx"))
@@ -1037,12 +1067,21 @@ pcsc_vendor_specific_init (int slot)
       if (sw)
         return SW_NOT_SUPPORTED;
     }
-  else if (vendor == VENDOR_SCM && product == SCM_SPR532) /* SCM SPR532 */
+  else if (vendor == VENDOR_SCM && product == SCM_SPR532)
     {
-      reader_table[slot].is_spr532 = 1;
+      const unsigned char cmd[] = { '\x80', '\x02', '\x00' };
+
+      sw = control_pcsc (slot, CM_IOCTL_VENDOR_IFD_EXCHANGE,
+                         cmd, sizeof (cmd), NULL, 0);
+      /* Even though it's control at IFD level (request to the
+       * reader, not card), it returns an error when card is
+       * not active.  Just ignore the error.
+       */
+      if (sw)
+        log_debug ("Ignore control_pcsc failure.\n");
       reader_table[slot].pinpad_varlen_supported = 1;
     }
-  else if (vendor == 0x046a)
+  else if (vendor == VENDOR_CHERRY)
     {
       /* Cherry ST-2xxx (product == 0x003e) supports TPDU level
        * exchange.  Other products which only support short APDU level
@@ -1051,11 +1090,12 @@ pcsc_vendor_specific_init (int slot)
       reader_table[slot].pcsc.pinmax = 15;
       reader_table[slot].pinpad_varlen_supported = 1;
     }
-  else if (vendor == 0x0c4b /* Tested with Reiner cyberJack GO */
-           || vendor == 0x1a44 /* Tested with Vasco DIGIPASS 920 */
-           || vendor == 0x234b /* Tested with FSIJ Gnuk Token */
-           || vendor == 0x0d46 /* Tested with KAAN Advanced??? */
-           || (vendor == 0x1fc9 && product == 0x81e6) /* Tested with Trustica Cryptoucan */)
+  else if (vendor == VENDOR_REINER /* Tested with Reiner cyberJack GO */
+           || vendor == VENDOR_VASCO /* Tested with Vasco DIGIPASS 920 */
+           || vendor == VENDOR_FSIJ /* Tested with FSIJ Gnuk Token */
+           || vendor == VENDOR_KAAN /* Tested with KAAN Advanced??? */
+           || (vendor == VENDOR_NXP
+               && product == CRYPTOUCAN) /* Tested with Trustica Cryptoucan */)
     reader_table[slot].pinpad_varlen_supported = 1;
 
   return 0;
@@ -1255,7 +1295,6 @@ pcsc_pinpad_verify (int slot, int class, int ins, int p0, int p1,
    */
   unsigned char result[6];
   pcsc_dword_t resultlen = 6;
-  int no_lc;
 
   if (!reader_table[slot].atrlen
       && (sw = reset_pcsc_reader (slot)))
@@ -1267,8 +1306,6 @@ pcsc_pinpad_verify (int slot, int class, int ins, int p0, int p1,
   pin_verify = xtrymalloc (len);
   if (!pin_verify)
     return SW_HOST_OUT_OF_CORE;
-
-  no_lc = (!pininfo->fixedlen && reader_table[slot].is_spr532);
 
   pin_verify[0] = 0x00; /* bTimeOut */
   pin_verify[1] = 0x00; /* bTimeOut2 */
@@ -1286,8 +1323,8 @@ pcsc_pinpad_verify (int slot, int class, int ins, int p0, int p1,
   pin_verify[11] = 0x00; /* bMsgIndex */
   pin_verify[12] = 0x00; /* bTeoPrologue[0] */
   pin_verify[13] = 0x00; /* bTeoPrologue[1] */
-  pin_verify[14] = pininfo->fixedlen + 0x05 - no_lc; /* bTeoPrologue[2] */
-  pin_verify[15] = pininfo->fixedlen + 0x05 - no_lc; /* ulDataLength */
+  pin_verify[14] = pininfo->fixedlen + 0x05; /* bTeoPrologue[2] */
+  pin_verify[15] = pininfo->fixedlen + 0x05; /* ulDataLength */
   pin_verify[16] = 0x00; /* ulDataLength */
   pin_verify[17] = 0x00; /* ulDataLength */
   pin_verify[18] = 0x00; /* ulDataLength */
@@ -1298,8 +1335,6 @@ pcsc_pinpad_verify (int slot, int class, int ins, int p0, int p1,
   pin_verify[23] = pininfo->fixedlen; /* abData[4] */
   if (pininfo->fixedlen)
     memset (&pin_verify[24], 0xff, pininfo->fixedlen);
-  else if (no_lc)
-    len--;
 
   if (DBG_CARD_IO)
     log_debug ("send secure: c=%02X i=%02X p1=%02X p2=%02X len=%d pinmax=%d\n",
@@ -1330,7 +1365,6 @@ pcsc_pinpad_modify (int slot, int class, int ins, int p0, int p1,
   int len = PIN_MODIFY_STRUCTURE_SIZE + 2 * pininfo->fixedlen;
   unsigned char result[6];      /* See the comment at pinpad_verify.  */
   pcsc_dword_t resultlen = 6;
-  int no_lc;
 
   if (!reader_table[slot].atrlen
       && (sw = reset_pcsc_reader (slot)))
@@ -1342,8 +1376,6 @@ pcsc_pinpad_modify (int slot, int class, int ins, int p0, int p1,
   pin_modify = xtrymalloc (len);
   if (!pin_modify)
     return SW_HOST_OUT_OF_CORE;
-
-  no_lc = (!pininfo->fixedlen && reader_table[slot].is_spr532);
 
   pin_modify[0] = 0x00; /* bTimeOut */
   pin_modify[1] = 0x00; /* bTimeOut2 */
@@ -1372,8 +1404,8 @@ pcsc_pinpad_modify (int slot, int class, int ins, int p0, int p1,
   pin_modify[16] = 0x02; /* bMsgIndex3 */
   pin_modify[17] = 0x00; /* bTeoPrologue[0] */
   pin_modify[18] = 0x00; /* bTeoPrologue[1] */
-  pin_modify[19] = 2 * pininfo->fixedlen + 0x05 - no_lc; /* bTeoPrologue[2] */
-  pin_modify[20] = 2 * pininfo->fixedlen + 0x05 - no_lc; /* ulDataLength */
+  pin_modify[19] = 2 * pininfo->fixedlen + 0x05; /* bTeoPrologue[2] */
+  pin_modify[20] = 2 * pininfo->fixedlen + 0x05; /* ulDataLength */
   pin_modify[21] = 0x00; /* ulDataLength */
   pin_modify[22] = 0x00; /* ulDataLength */
   pin_modify[23] = 0x00; /* ulDataLength */
@@ -1384,8 +1416,6 @@ pcsc_pinpad_modify (int slot, int class, int ins, int p0, int p1,
   pin_modify[28] = 2 * pininfo->fixedlen; /* abData[4] */
   if (pininfo->fixedlen)
     memset (&pin_modify[29], 0xff, 2 * pininfo->fixedlen);
-  else if (no_lc)
-    len--;
 
   if (DBG_CARD_IO)
     log_debug ("send secure: c=%02X i=%02X p1=%02X p2=%02X len=%d pinmax=%d\n",
@@ -1421,6 +1451,7 @@ static int
 close_ccid_reader (int slot)
 {
   ccid_close_reader (reader_table[slot].ccid.handle);
+  reader_table[slot].ccid.handle = NULL;
   return 0;
 }
 
@@ -1562,12 +1593,14 @@ ccid_pinpad_operation (int slot, int class, int ins, int p0, int p1,
 
 /* Open the reader and try to read an ATR.  */
 static int
-open_ccid_reader (struct dev_list *dl)
+open_ccid_reader (struct dev_list *dl, int *r_cciderr)
 {
   int err;
   int slot;
   int require_get_status;
   reader_table_t slotp;
+
+  *r_cciderr = 0;
 
   slot = new_reader_slot ();
   if (slot == -1)
@@ -1581,13 +1614,17 @@ open_ccid_reader (struct dev_list *dl)
       err = ccid_get_atr (slotp->ccid.handle,
                           slotp->atr, sizeof slotp->atr, &slotp->atrlen);
       if (err)
-        ccid_close_reader (slotp->ccid.handle);
+        {
+          ccid_close_reader (slotp->ccid.handle);
+          slotp->ccid.handle = NULL;
+        }
     }
 
   if (err)
     {
       slotp->used = 0;
       unlock_slot (slot);
+      *r_cciderr = err;
       return -1;
     }
 
@@ -2047,6 +2084,12 @@ apdu_dev_list_finish (struct dev_list *dl)
       xfree (dl->table);
       for (i = 0; i < MAX_READER; i++)
         pcsc.rdrname[i] = NULL;
+
+      if (pcsc.count == 0)
+        {
+          pcsc_release_context (pcsc.context);
+          pcsc.context = 0;
+        }
     }
   xfree (dl);
   npth_mutex_unlock (&reader_table_lock);
@@ -2082,9 +2125,11 @@ apdu_open_reader (struct dev_list *dl)
 #ifdef HAVE_LIBUSB
   if (!opt.disable_ccid)
     { /* CCID readers.  */
+      int cciderr;
+
       if (readerno > 0)
         { /* Use single, the specific reader.  */
-          slot = open_ccid_reader (dl);
+          slot = open_ccid_reader (dl, &cciderr);
           /* And stick the reader and no scan.  */
           dl->idx = dl->idx_max;
           return slot;
@@ -2109,7 +2154,7 @@ apdu_open_reader (struct dev_list *dl)
               if (DBG_READER)
                 log_debug ("apdu_open_reader: new device=%x\n", bai);
 
-              slot = open_ccid_reader (dl);
+              slot = open_ccid_reader (dl, &cciderr);
 
               dl->idx++;
               if (slot >= 0)
@@ -2118,6 +2163,11 @@ apdu_open_reader (struct dev_list *dl)
                 {
                   /* Skip this reader.  */
                   log_error ("ccid open error: skip\n");
+                  if (cciderr == CCID_DRIVER_ERR_USB_ACCESS)
+                    log_info ("check permission of USB device at"
+                              " Bus %03d Device %03d\n",
+                              ((bai >> 16) & 0xff),
+                              ((bai >> 8) & 0xff));
                   continue;
                 }
             }
@@ -2925,7 +2975,12 @@ send_le (int slot, int class, int ins, int p0, int p1,
       log_debug (" response: sw=%04X  datalen=%d\n",
                  sw, (unsigned int)resultlen);
       if ( !retbuf && (sw == SW_SUCCESS || (sw & 0xff00) == SW_MORE_DATA))
-        log_printhex (result, resultlen, "    dump: ");
+        {
+          if (all_zero_p (result, resultlen))
+            log_debug ("     dump: [all zero]\n");
+          else
+            log_printhex (result, resultlen, "     dump:");
+        }
     }
 
   if (sw == SW_SUCCESS || sw == SW_EOF_REACHED)
@@ -2998,7 +3053,12 @@ send_le (int slot, int class, int ins, int p0, int p1,
               log_debug ("     more: sw=%04X  datalen=%d\n",
                          sw, (unsigned int)resultlen);
               if (!retbuf && (sw==SW_SUCCESS || (sw&0xff00)==SW_MORE_DATA))
-                log_printhex (result, resultlen, "     dump: ");
+                {
+                  if (all_zero_p (result, resultlen))
+                    log_debug ( "    dump: [all zero]\n");
+                  else
+                    log_printhex (result, resultlen, "      dump:");
+                }
             }
 
           if ((sw & 0xff00) == SW_MORE_DATA
@@ -3044,7 +3104,12 @@ send_le (int slot, int class, int ins, int p0, int p1,
   xfree (result_buffer);
 
   if (DBG_CARD_IO && retbuf && sw == SW_SUCCESS)
-    log_printhex (*retbuf, *retbuflen, "      dump: ");
+    {
+      if (all_zero_p (*retbuf, *retbuflen))
+        log_debug ("     dump: [all zero]\n");
+      else
+        log_printhex (*retbuf, *retbuflen, "     dump:");
+    }
 
   return sw;
 }

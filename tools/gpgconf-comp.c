@@ -101,6 +101,7 @@ gc_error (int status, int errnum, const char *fmt, ...)
 static void gpg_agent_runtime_change (int killflag);
 static void scdaemon_runtime_change (int killflag);
 static void dirmngr_runtime_change (int killflag);
+static void keyboxd_runtime_change (int killflag);
 
 
 
@@ -490,6 +491,18 @@ static known_option_t known_options_dirmngr[] =
    { NULL }
  };
 
+/* The known options of the GC_COMPONENT_KEYBOXD component.  */
+static known_option_t known_options_keyboxd[] =
+ {
+   { "verbose",           GC_OPT_FLAG_LIST, GC_LEVEL_BASIC },
+   { "quiet",             GC_OPT_FLAG_NONE, GC_LEVEL_BASIC },
+   { "log-file",          GC_OPT_FLAG_NONE, GC_LEVEL_ADVANCED,
+                          GC_ARG_TYPE_FILENAME },
+   { "faked-system-time", GC_OPT_FLAG_NONE, GC_LEVEL_INVISIBLE },
+
+   { NULL }
+ };
+
 
 /* The known options of the GC_COMPONENT_PINENTRY component.  */
 static known_option_t known_options_pinentry[] =
@@ -596,6 +609,10 @@ static struct
 
 } gc_component[GC_COMPONENT_NR] =
   {
+   /* Note: The order of the items must match the order given in the
+    * gc_component_id_t enumeration.  The order is often used by
+    * frontends to display the backend options thus do not change the
+    * order without considering the user experience.  */
    { NULL },   /* DUMMY for GC_COMPONENT_ANY */
 
    { GPG_NAME,  GPG_DISP_NAME,     "gnupg",  N_("OpenPGP"),
@@ -605,6 +622,10 @@ static struct
    { GPGSM_NAME, GPGSM_DISP_NAME,  "gnupg",  N_("S/MIME"),
      GNUPG_MODULE_NAME_GPGSM, GPGSM_NAME ".conf",
      known_options_gpgsm },
+
+   { KEYBOXD_NAME, KEYBOXD_DISP_NAME, "gnupg", N_("Public Keys"),
+     GNUPG_MODULE_NAME_KEYBOXD, KEYBOXD_NAME ".conf",
+     known_options_keyboxd, keyboxd_runtime_change },
 
    { GPG_AGENT_NAME, GPG_AGENT_DISP_NAME, "gnupg", N_("Private Keys"),
      GNUPG_MODULE_NAME_AGENT, GPG_AGENT_NAME ".conf",
@@ -772,6 +793,38 @@ dirmngr_runtime_change (int killflag)
 }
 
 
+static void
+keyboxd_runtime_change (int killflag)
+{
+  gpg_error_t err = 0;
+  const char *pgmname;
+  const char *argv[6];
+  pid_t pid = (pid_t)(-1);
+
+  pgmname = gnupg_module_name (GNUPG_MODULE_NAME_CONNECT_AGENT);
+  argv[0] = "--no-autostart";
+  argv[1] = "--keyboxd";
+  argv[2] = killflag? "KILLKEYBOXD" : "RELOADKEYBOXD";
+  if (gnupg_default_homedir_p ())
+    argv[3] = NULL;
+  else
+    {
+      argv[3] = "--homedir";
+      argv[4] = gnupg_homedir ();
+      argv[5] = NULL;
+    }
+
+  if (!err)
+    err = gnupg_spawn_process_fd (pgmname, argv, -1, -1, -1, &pid);
+  if (!err)
+    err = gnupg_wait_process (pgmname, pid, 1, NULL);
+  if (err)
+    gc_error (0, 0, "error running '%s %s': %s",
+              pgmname, argv[2], gpg_strerror (err));
+  gnupg_release_process (pid);
+}
+
+
 /* Launch the gpg-agent or the dirmngr if not already running.  */
 gpg_error_t
 gc_component_launch (int component)
@@ -786,11 +839,14 @@ gc_component_launch (int component)
     {
       err = gc_component_launch (GC_COMPONENT_GPG_AGENT);
       if (!err)
+        err = gc_component_launch (GC_COMPONENT_KEYBOXD);
+      if (!err)
         err = gc_component_launch (GC_COMPONENT_DIRMNGR);
       return err;
     }
 
   if (!(component == GC_COMPONENT_GPG_AGENT
+        || component == GC_COMPONENT_KEYBOXD
         || component == GC_COMPONENT_DIRMNGR))
     {
       log_error ("%s\n", _("Component not suitable for launching"));
@@ -816,6 +872,8 @@ gc_component_launch (int component)
     }
   if (component == GC_COMPONENT_DIRMNGR)
     argv[i++] = "--dirmngr";
+  else if (component == GC_COMPONENT_KEYBOXD)
+    argv[i++] = "--keyboxd";
   argv[i++] = "NOP";
   argv[i] = NULL;
 
@@ -825,7 +883,8 @@ gc_component_launch (int component)
   if (err)
     gc_error (0, 0, "error running '%s%s%s': %s",
               pgmname,
-              component == GC_COMPONENT_DIRMNGR? " --dirmngr":"",
+              component == GC_COMPONENT_DIRMNGR? " --dirmngr"
+              : component == GC_COMPONENT_KEYBOXD? " --keyboxd":"",
               " NOP",
               gpg_strerror (err));
   gnupg_release_process (pid);
@@ -1549,8 +1608,8 @@ retrieve_options_from_program (gc_component_id_t component, int only_installed)
 
   while ((length = es_read_line (outfp, &line, &line_len, NULL)) > 0)
     {
-      char *fields[4];
-      char *optname, *optdesc;
+      const char *fields[4];
+      const char *optname, *optdesc;
       unsigned int optflags;
       int short_opt;
       gc_arg_type_t arg_type;
@@ -1617,8 +1676,8 @@ retrieve_options_from_program (gc_component_id_t component, int only_installed)
                                         string_array_size,
                                         sizeof *string_array);
         }
-      string_array[string_array_used++] = optname = xstrdup (fields[0]);
-      string_array[string_array_used++] = optdesc = xstrdup (fields[3]);
+      optname = string_array[string_array_used++] = xstrdup (fields[0]);
+      optdesc = string_array[string_array_used++] = xstrdup (fields[3]);
 
       /* Create an option table which can then be supplied to
        * gpgrt_parser.  Unfortunately there is no private pointer in
@@ -1815,8 +1874,9 @@ retrieve_options_from_program (gc_component_id_t component, int only_installed)
   pargs.flags = (ARGPARSE_FLAG_KEEP
                  | ARGPARSE_FLAG_SYS
                  | ARGPARSE_FLAG_USER
-                 | ARGPARSE_FLAG_WITHATTR
-                 | ARGPARSE_FLAG_VERBOSE);
+                 | ARGPARSE_FLAG_WITHATTR);
+  if (opt.verbose)
+    pargs.flags |= ARGPARSE_FLAG_VERBOSE;
 
   while (gpgrt_argparser (&pargs, opt_table, config_name))
     {

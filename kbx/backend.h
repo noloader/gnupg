@@ -20,6 +20,7 @@
 #ifndef KBX_BACKEND_H
 #define KBX_BACKEND_H
 
+#include <ksba.h>
 #include "keybox-search-desc.h"
 
 /* Forward declaration of the keybox handle type.  */
@@ -114,10 +115,14 @@ gpg_error_t be_find_request_part (backend_handle_t backend_hd,
                                   db_request_part_t *r_part);
 gpg_error_t be_return_pubkey (ctrl_t ctrl, const void *buffer, size_t buflen,
                               enum pubkey_types pubkey_type,
-                              const unsigned char *ubid);
+                              const unsigned char *ubid,
+                              int is_ephemeral, int is_revoked,
+                              int uidno, int pkno);
 int be_is_x509_blob (const unsigned char *blob, size_t bloblen);
 gpg_error_t be_ubid_from_blob (const void *blob, size_t bloblen,
                                enum pubkey_types *r_pktype, char *r_ubid);
+char *be_get_x509_serial (ksba_cert_t cert);
+gpg_error_t be_get_x509_keygrip (ksba_cert_t cert, unsigned char *keygrip);
 
 
 /*-- backend-cache.c --*/
@@ -166,6 +171,8 @@ void be_sqlite_release_resource (ctrl_t ctrl, backend_handle_t hd);
 gpg_error_t be_sqlite_init_local (backend_handle_t backend_hd,
                                   db_request_part_t part);
 void be_sqlite_release_local (be_sqlite_local_t ctx);
+gpg_error_t be_sqlite_rollback (void);
+gpg_error_t be_sqlite_commit (void);
 gpg_error_t be_sqlite_search (ctrl_t ctrl, backend_handle_t hd,
                               db_request_t request,
                               KEYDB_SEARCH_DESC *desc, unsigned int ndesc);

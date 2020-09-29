@@ -103,7 +103,8 @@ check_signature (ctrl_t ctrl, PKT_signature *sig, gcry_md_hd_t digest)
  * v5 signatures.  They may be NULL to use the default.
  *
  * If FORCED_PK is not NULL this public key is used to verify the
- * signature and no other public key is looked up.
+ * signature and no other public key is looked up.  This is used to
+ * verify against a key included in the signature.
  *
  * If R_EXPIREDATE is not NULL, R_EXPIREDATE is set to the key's
  * expiry.
@@ -172,7 +173,7 @@ check_signature2 (ctrl_t ctrl,
   else if (get_pubkey_for_sig (ctrl, pk, sig, forced_pk))
     rc = gpg_error (GPG_ERR_NO_PUBKEY);
   else if (!gnupg_pk_is_allowed (opt.compliance, PK_USE_VERIFICATION,
-                                 pk->pubkey_algo, pk->pkey,
+                                 pk->pubkey_algo, 0, pk->pkey,
                                  nbits_from_pk (pk),
                                  NULL))
     {

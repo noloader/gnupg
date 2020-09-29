@@ -59,7 +59,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
-#include <assert.h>
 
 #include "gpgsm.h"
 #include <gcrypt.h>
@@ -67,6 +66,7 @@
 
 #include "keydb.h"
 #include "../common/i18n.h"
+#include "../common/membuf.h"
 
 
 enum para_name
@@ -447,7 +447,7 @@ proc_parameters (ctrl_t ctrl, struct para_data_s *para,
   char *cardkeyid = NULL;
 
   /* Check that we have all required parameters; */
-  assert (get_parameter (para, pKEYTYPE, 0));
+  log_assert (get_parameter (para, pKEYTYPE, 0));
 
   /* There is a problem with pkcs-10 on how to use ElGamal because it
      is expected that a PK algorithm can always be used for
@@ -629,7 +629,7 @@ proc_parameters (ctrl_t ctrl, struct para_data_s *para,
 
   /* Check the optional AuthorityKeyId.  */
   string = get_parameter_value (para, pAUTHKEYID, 0);
-  if (string)
+  if (string && strcmp (string, "none"))
     {
       for (s=string, i=0; hexdigitp (s); s++, i++)
         ;
@@ -644,7 +644,7 @@ proc_parameters (ctrl_t ctrl, struct para_data_s *para,
 
   /* Check the optional SubjectKeyId.  */
   string = get_parameter_value (para, pSUBJKEYID, 0);
-  if (string)
+  if (string && strcmp (string, "none"))
     {
       for (s=string, i=0; hexdigitp (s); s++, i++)
         ;
@@ -835,28 +835,49 @@ create_request (ctrl_t ctrl,
   ksba_isotime_t atime;
   int certmode = 0;
   int mdalgo;
+  membuf_t tbsbuffer;
+  membuf_t *tbsmb = NULL;
+  size_t publiclen;
+  size_t sigkeylen;
+  int publicpkalgo;  /* The gcrypt public key algo of the public key.  */
+  int sigkeypkalgo;  /* The gcrypt public key algo of the signing key.  */
 
   err = ksba_certreq_new (&cr);
   if (err)
     return err;
 
-  len = gcry_sexp_canon_len (public, 0, NULL, NULL);
-  if (get_pk_algo_from_canon_sexp (public, len) == GCRY_PK_EDDSA)
-    mdalgo = GCRY_MD_SHA512;
-  else if ((string = get_parameter_value (para, pHASHALGO, 0)))
-    mdalgo = gcry_md_map_name (string);
-  else
-    mdalgo = GCRY_MD_SHA256;
-  rc = gcry_md_open (&md, mdalgo, 0);
-  if (rc)
-    {
-      log_error ("md_open failed: %s\n", gpg_strerror (rc));
-      goto leave;
-    }
-  if (DBG_HASHING)
-    gcry_md_debug (md, "cr.cri");
+  publiclen = gcry_sexp_canon_len (public, 0, NULL, NULL);
+  sigkeylen = sigkey? gcry_sexp_canon_len (sigkey, 0, NULL, NULL) : 0;
 
-  ksba_certreq_set_hash_function (cr, HASH_FNC, md);
+  publicpkalgo = get_pk_algo_from_canon_sexp (public, publiclen);
+  sigkeypkalgo = sigkey? get_pk_algo_from_canon_sexp (public, publiclen) : 0;
+
+  if (publicpkalgo == GCRY_PK_EDDSA)
+    {
+      mdalgo = GCRY_MD_SHA512;
+      md = NULL;  /* We sign the data and not a hash.  */
+      init_membuf (&tbsbuffer, 2048);
+      tbsmb = &tbsbuffer;
+      ksba_certreq_set_hash_function
+        (cr, (void (*)(void *, const void*,size_t))put_membuf, tbsmb);
+    }
+  else
+    {
+      if ((string = get_parameter_value (para, pHASHALGO, 0)))
+        mdalgo = gcry_md_map_name (string);
+      else
+        mdalgo = GCRY_MD_SHA256;
+      rc = gcry_md_open (&md, mdalgo, 0);
+      if (rc)
+        {
+          log_error ("md_open failed: %s\n", gpg_strerror (rc));
+          goto leave;
+        }
+      if (DBG_HASHING)
+        gcry_md_debug (md, "cr.cri");
+      ksba_certreq_set_hash_function (cr, HASH_FNC, md);
+    }
+
   ksba_certreq_set_writer (cr, writer);
 
   err = ksba_certreq_add_subject (cr, get_parameter_value (para, pNAMEDN, 0));
@@ -893,7 +914,7 @@ create_request (ctrl_t ctrl,
   for (seq=0; (s = get_parameter_value (para, pNAMEDNS, seq)); seq++)
     {
       len = strlen (s);
-      assert (len);
+      log_assert (len);
       snprintf (numbuf, DIM(numbuf), "%u:", (unsigned int)len);
       buf = p = xtrymalloc (11 + strlen (numbuf) + len + 3);
       if (!buf)
@@ -920,7 +941,7 @@ create_request (ctrl_t ctrl,
   for (seq=0; (s = get_parameter_value (para, pNAMEURI, seq)); seq++)
     {
       len = strlen (s);
-      assert (len);
+      log_assert (len);
       snprintf (numbuf, DIM(numbuf), "%u:", (unsigned int)len);
       buf = p = xtrymalloc (6 + strlen (numbuf) + len + 3);
       if (!buf)
@@ -944,12 +965,10 @@ create_request (ctrl_t ctrl,
         }
     }
 
-
   err = ksba_certreq_set_public_key (cr, public);
   if (err)
     {
-      log_error ("error setting the public key: %s\n",
-                 gpg_strerror (err));
+      log_error ("error setting the public key: %s\n", gpg_strerror (err));
       rc = err;
       goto leave;
     }
@@ -1145,14 +1164,17 @@ create_request (ctrl_t ctrl,
          given we set it to the public key to create a self-signed
          certificate. */
       if (!sigkey)
-        sigkey = public;
+        {
+          sigkey = public;
+          sigkeylen = publiclen;
+          sigkeypkalgo = publicpkalgo;
+        }
 
+      /* Set the the digestinfo aka siginfo.  */
       {
         unsigned char *siginfo;
 
-        err = transform_sigval (sigkey,
-                                gcry_sexp_canon_len (sigkey, 0, NULL, NULL),
-                                mdalgo, &siginfo, NULL);
+        err = transform_sigval (sigkey, sigkeylen, mdalgo, &siginfo, NULL);
         if (!err)
           {
             err = ksba_certreq_set_siginfo (cr, siginfo);
@@ -1167,9 +1189,12 @@ create_request (ctrl_t ctrl,
           }
       }
 
+
       /* Insert the AuthorityKeyId.  */
       string = get_parameter_value (para, pAUTHKEYID, 0);
-      if (string)
+      if (string && !strcmp (string, "none"))
+        ; /* Do not issue an AKI.  */
+      else if (string)
         {
           char *hexbuf;
 
@@ -1195,20 +1220,69 @@ create_request (ctrl_t ctrl,
           hexbuf[2] = 0x80;  /* Context tag for an implicit Octet string.  */
           hexbuf[3] = len;
           err = ksba_certreq_add_extension (cr, oidstr_authorityKeyIdentifier,
-                                            0,
-                                            hexbuf, 4+len);
+                                            0, hexbuf, 4+len);
           xfree (hexbuf);
           if (err)
             {
-              log_error ("error setting the authority-key-id: %s\n",
+              log_error ("error setting the AKI: %s\n", gpg_strerror (err));
+              goto leave;
+            }
+        }
+      else if (publicpkalgo == GCRY_PK_EDDSA || publicpkalgo == GCRY_PK_ECC)
+        {
+          /* For EdDSA and ECC we add the public key as default identifier.  */
+          const unsigned char *q;
+          size_t qlen, derlen;
+          unsigned char *der;
+
+          err = get_ecc_q_from_canon_sexp (public, publiclen, &q, &qlen);
+          if (err)
+            {
+              log_error ("error getting Q from public key: %s\n",
                          gpg_strerror (err));
+              goto leave;
+            }
+          if (publicpkalgo == GCRY_PK_EDDSA && qlen>32 && (qlen&1) && *q==0x40)
+            {
+              /* Skip our optional native encoding octet.  */
+              q++;
+              qlen--;
+            }
+          /* FIXME: For plain ECC we should better use a compressed
+           * point.  That requires an updated Libgcrypt.  Without that
+           * using nistp521 won't work due to the length check below.  */
+          if (qlen > 125)
+            {
+              err = gpg_error (GPG_ERR_TOO_LARGE);
+              goto leave;
+            }
+          derlen = 4 + qlen;
+          der = xtrymalloc (derlen);
+          if (!der)
+            {
+              err = gpg_error_from_syserror ();
+              goto leave;
+            }
+          der[0] = 0x30; /* Sequence */
+          der[1] = qlen + 2;
+          der[2] = 0x80; /* Context tag for an implict Octet String. */
+          der[3] = qlen;
+          memcpy (der+4, q, qlen);
+          err = ksba_certreq_add_extension (cr, oidstr_authorityKeyIdentifier,
+                                            0, der, derlen);
+          xfree (der);
+          if (err)
+            {
+              log_error ("error setting the AKI: %s\n", gpg_strerror (err));
               goto leave;
             }
         }
 
       /* Insert the SubjectKeyId.  */
       string = get_parameter_value (para, pSUBJKEYID, 0);
-      if (string)
+      if (string && !strcmp (string, "none"))
+        ; /* Do not issue an SKI.  */
+      else if (string)
         {
           char *hexbuf;
 
@@ -1236,8 +1310,55 @@ create_request (ctrl_t ctrl,
           xfree (hexbuf);
           if (err)
             {
-              log_error ("error setting the subject-key-id: %s\n",
+              log_error ("error setting SKI: %s\n", gpg_strerror (err));
+              goto leave;
+            }
+        }
+      else if (sigkeypkalgo == GCRY_PK_EDDSA || sigkeypkalgo == GCRY_PK_ECC)
+        {
+          /* For EdDSA and ECC we add the public key as default identifier.  */
+          const unsigned char *q;
+          size_t qlen, derlen;
+          unsigned char *der;
+
+          /* FIXME: This assumes that the to-be-certified key uses the
+           * same algorithm as the certification key - this is not
+           * always the case; in fact it is common that they
+           * differ.  */
+          err = get_ecc_q_from_canon_sexp (sigkey, sigkeylen, &q, &qlen);
+          if (err)
+            {
+              log_error ("error getting Q from signature key: %s\n",
                          gpg_strerror (err));
+              goto leave;
+            }
+          if (sigkeypkalgo == GCRY_PK_EDDSA && qlen>32 && (qlen&1) && *q==0x40)
+            {
+              /* Skip our optional native encoding octet.  */
+              q++;
+              qlen--;
+            }
+          if (qlen > 127)
+            {
+              err = gpg_error (GPG_ERR_TOO_LARGE);
+              goto leave;
+            }
+          derlen = 2 + qlen;
+          der = xtrymalloc (derlen);
+          if (!der)
+            {
+              err = gpg_error_from_syserror ();
+              goto leave;
+            }
+          der[0] = 0x04; /* Octet String */
+          der[1] = qlen;
+          memcpy (der+2, q, qlen);
+          err = ksba_certreq_add_extension (cr, oidstr_subjectKeyIdentifier, 0,
+                                            der, derlen);
+          xfree (der);
+          if (err)
+            {
+              log_error ("error setting the SKI: %s\n", gpg_strerror (err));
               goto leave;
             }
         }
@@ -1301,7 +1422,11 @@ create_request (ctrl_t ctrl,
         }
     }
   else
-    sigkey = public;
+    {
+      sigkey = public;
+      sigkeylen = publiclen;
+      sigkeypkalgo = publicpkalgo;
+    }
 
   do
     {
@@ -1315,20 +1440,14 @@ create_request (ctrl_t ctrl,
       if (stopreason == KSBA_SR_NEED_SIG)
         {
           gcry_sexp_t s_pkey;
-          size_t n;
           unsigned char grip[20];
           char hexgrip[41];
           unsigned char *sigval, *newsigval;
           size_t siglen;
+          void *tbsdata;
+          size_t tbsdatalen;
 
-          n = gcry_sexp_canon_len (sigkey, 0, NULL, NULL);
-          if (!n)
-            {
-              log_error ("libksba did not return a proper S-Exp\n");
-              rc = gpg_error (GPG_ERR_BUG);
-              goto leave;
-            }
-          rc = gcry_sexp_sscan (&s_pkey, NULL, (const char*)sigkey, n);
+          rc = gcry_sexp_sscan (&s_pkey, NULL, (const char*)sigkey, sigkeylen);
           if (rc)
             {
               log_error ("gcry_sexp_scan failed: %s\n", gpg_strerror (rc));
@@ -1344,15 +1463,31 @@ create_request (ctrl_t ctrl,
           gcry_sexp_release (s_pkey);
           bin2hex (grip, 20, hexgrip);
 
-          log_info ("about to sign the %s for key: &%s\n",
-                    certmode? "certificate":"CSR", hexgrip);
+          if (!opt.quiet)
+            log_info ("about to sign the %s for key: &%s\n",
+                      certmode? "certificate":"CSR", hexgrip);
 
           if (carddirect && !certmode)
-            rc = gpgsm_scd_pksign (ctrl, carddirect, NULL,
-                                   gcry_md_read (md, mdalgo),
-                                   gcry_md_get_algo_dlen (mdalgo),
-                                   mdalgo,
-                                   &sigval, &siglen);
+            {
+              if (tbsmb)
+                {
+                  tbsdata = get_membuf (tbsmb, &tbsdatalen);
+                  tbsmb = NULL;
+                  if (!tbsdata)
+                    rc = gpg_error_from_syserror ();
+                  else
+                    rc = gpgsm_scd_pksign (ctrl, carddirect, NULL,
+                                           tbsdata, tbsdatalen, 0,
+                                           &sigval, &siglen);
+                  xfree (tbsdata);
+                }
+              else
+                rc = gpgsm_scd_pksign (ctrl, carddirect, NULL,
+                                       gcry_md_read (md, mdalgo),
+                                       gcry_md_get_algo_dlen (mdalgo),
+                                       mdalgo,
+                                       &sigval, &siglen);
+            }
           else
             {
               char *orig_codeset;
@@ -1364,11 +1499,25 @@ create_request (ctrl_t ctrl,
                    " the passphrase for the key you just created once"
                    " more.\n"));
               i18n_switchback (orig_codeset);
-              rc = gpgsm_agent_pksign (ctrl, hexgrip, desc,
-                                       gcry_md_read(md, mdalgo),
-                                       gcry_md_get_algo_dlen (mdalgo),
-                                       mdalgo,
-                                       &sigval, &siglen);
+              if (tbsmb)
+                {
+                  tbsdata = get_membuf (tbsmb, &tbsdatalen);
+                  tbsmb = NULL;
+                  if (!tbsdata)
+                    rc = gpg_error_from_syserror ();
+                  else
+                    rc = gpgsm_agent_pksign (ctrl, hexgrip, desc,
+                                             tbsdata, tbsdatalen, 0,
+
+                                             &sigval, &siglen);
+                  xfree (tbsdata);
+                }
+              else
+                rc = gpgsm_agent_pksign (ctrl, hexgrip, desc,
+                                         gcry_md_read(md, mdalgo),
+                                         gcry_md_get_algo_dlen (mdalgo),
+                                         mdalgo,
+                                         &sigval, &siglen);
               xfree (desc);
             }
           if (rc)
@@ -1377,8 +1526,7 @@ create_request (ctrl_t ctrl,
               goto leave;
             }
 
-          err = transform_sigval (sigval, siglen, mdalgo,
-                                  &newsigval, NULL);
+          err = transform_sigval (sigval, siglen, mdalgo, &newsigval, NULL);
           xfree (sigval);
           if (!err)
             {
@@ -1398,6 +1546,8 @@ create_request (ctrl_t ctrl,
 
 
  leave:
+  if (tbsmb)
+    xfree (get_membuf (tbsmb, NULL));
   gcry_md_close (md);
   ksba_certreq_release (cr);
   return rc;

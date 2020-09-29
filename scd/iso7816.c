@@ -45,6 +45,7 @@
 #define CMD_GET_CHALLENGE         0x84
 #define CMD_READ_BINARY 0xB0
 #define CMD_READ_RECORD 0xB2
+#define CMD_UPDATE_BINARY 0xD6
 
 static gpg_error_t
 map_sw (int sw)
@@ -88,6 +89,13 @@ map_sw (int sw)
     case SW_HOST_ABORTED:        ec = GPG_ERR_INV_RESPONSE; break;
     case SW_HOST_NO_PINPAD:      ec = GPG_ERR_NOT_SUPPORTED; break;
     case SW_HOST_CANCELLED:      ec = GPG_ERR_CANCELED; break;
+    case SW_HOST_USB_OTHER:      ec = GPG_ERR_EIO; break;
+    case SW_HOST_USB_IO:         ec = GPG_ERR_EIO; break;
+    case SW_HOST_USB_ACCESS:     ec = GPG_ERR_EACCES; break;
+    case SW_HOST_USB_NO_DEVICE:  ec = GPG_ERR_ENODEV; break;
+    case SW_HOST_USB_BUSY:       ec = GPG_ERR_EBUSY; break;
+    case SW_HOST_USB_TIMEOUT:    ec = GPG_ERR_TIMEOUT; break;
+    case SW_HOST_USB_OVERFLOW:   ec = GPG_ERR_EOVERFLOW; break;
 
     default:
       if ((sw & 0x010000))
@@ -1017,4 +1025,24 @@ iso7816_read_record (int slot, int recno, int reccount, int short_ef,
   *resultlen = bufferlen;
 
   return 0;
+}
+
+
+/* Perform an UPDATE BINARY command on card in SLOT.  Write DATA of
+ * length DATALEN to a transparent file at OFFSET.  */
+gpg_error_t
+iso7816_update_binary (int slot, int extended_mode, size_t offset,
+                       const void *data, size_t datalen)
+{
+  int sw;
+
+  /* We can only encode 15 bits in p0,p1 to indicate an offset. Thus
+   * we check for this limit. */
+  if (offset > 32767)
+    return gpg_error (GPG_ERR_INV_VALUE);
+
+  sw = apdu_send_simple (slot, extended_mode, 0x00, CMD_UPDATE_BINARY,
+                         ((offset>>8) & 0xff), (offset & 0xff),
+                         datalen, (const char*)data);
+  return map_sw (sw);
 }

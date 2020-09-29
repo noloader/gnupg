@@ -24,7 +24,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
-#include <assert.h>
 #ifdef HAVE_LOCALE_H
 #include <locale.h>
 #endif
@@ -38,7 +37,7 @@
 
 #include "keydb.h"
 #include "../common/i18n.h"
-
+#include "../common/membuf.h"
 
 struct dn_array_s {
   char *key;
@@ -46,6 +45,28 @@ struct dn_array_s {
   int   multivalued;
   int   done;
 };
+
+
+/* Get the first first element from the s-expression SN and return a
+ * pointer to it.  Stores the length at R_LENGTH.  Returns NULL for no
+ * value or an invalid expression.  */
+const void *
+gpgsm_get_serial (ksba_const_sexp_t sn, size_t *r_length)
+{
+  const char *p = (const char *)sn;
+  unsigned long n;
+  char *endp;
+
+  if (!p || *p != '(')
+    return NULL;
+  p++;
+  n = strtoul (p, &endp, 10);
+  p = endp;
+  if (*p++ != ':')
+    return NULL;
+  *r_length = n;
+  return p;
+}
 
 
 /* Print the first element of an S-Expression. */
@@ -69,6 +90,85 @@ gpgsm_print_serial (estream_t fp, ksba_const_sexp_t sn)
         es_fputs ("[Internal Error - invalid S-expression]", fp);
       else
         es_write_hexstring (fp, p, n, 0, NULL);
+    }
+}
+
+
+/* Print the first element of an S-Expression in decimal notation
+ * assuming it is a non-negative integer. */
+void
+gpgsm_print_serial_decimal (estream_t fp, ksba_const_sexp_t sn)
+{
+  const char *p = (const char *)sn;
+  unsigned long n, i;
+  char *endp;
+  gcry_mpi_t a, r, ten;
+#if GCRYPT_VERSION_NUMBER >= 0x010900 /* >= 1.9.0 */
+  unsigned int dd;
+#else
+  unsigned char numbuf[10];
+#endif
+
+  if (!p)
+    es_fputs (_("none"), fp);
+  else if (*p != '(')
+    es_fputs ("[Internal error - not an S-expression]", fp);
+  else
+    {
+      p++;
+      n = strtoul (p, &endp, 10);
+      p = endp;
+      if (*p++ != ':')
+        es_fputs ("[Internal Error - invalid S-expression]", fp);
+      else if (gcry_mpi_scan (&a, GCRYMPI_FMT_USG, p, n, NULL))
+        es_fputs ("[Internal Error - can't convert to decimal]", fp);
+      else
+        {
+          membuf_t mb = MEMBUF_ZERO;
+          char *buf;
+          int c;
+
+          ten = gcry_mpi_set_ui (NULL, 10);
+          r = gcry_mpi_new (0);
+
+          do
+            {
+              gcry_mpi_div (a, r, a, ten, 0);
+#if GCRYPT_VERSION_NUMBER >= 0x010900 /* >= 1.9.0 */
+              gcry_mpi_get_ui (&dd, r);
+              put_membuf_printf (&mb, "%u", dd);
+#else
+              *numbuf = 0;  /* Need to clear because USB format prints
+                             * an empty string for a value of 0.  */
+              gcry_mpi_print (GCRYMPI_FMT_USG, numbuf, 10, NULL, r);
+              put_membuf_printf (&mb, "%u", (unsigned int)*numbuf);
+#endif
+            }
+          while (gcry_mpi_cmp_ui (a, 0));
+
+          /* Make sure we have at least an empty string, get it,
+           * reverse it, and print it. */
+          put_membuf (&mb, "", 1);
+          buf = get_membuf (&mb, NULL);
+          if (!buf)
+            es_fputs ("[Internal Error - out of core]", fp);
+          else
+            {
+              n = strlen (buf);
+              for (i=0; i < n/2; i++)
+                {
+                  c = buf[i];
+                  buf[i] = buf[n-1-i];
+                  buf[n-1-i] = c;
+                }
+              es_fputs (buf, fp);
+              xfree (buf);
+            }
+
+          gcry_mpi_release (r);
+          gcry_mpi_release (ten);
+          gcry_mpi_release (a);
+        }
     }
 }
 
@@ -348,7 +448,7 @@ parse_dn_part (struct dn_array_s *array, const unsigned char *string)
     { /* hexstring */
       string++;
       for (s=string; hexdigitp (s); s++)
-        s++;
+        ;
       n = s - string;
       if (!n || (n & 1))
         return NULL; /* Empty or odd number of digits. */
@@ -553,7 +653,7 @@ pretty_es_print_sexp (estream_t fp, const unsigned char *buf, size_t buflen)
       return;
     }
   len = gcry_sexp_sprint (sexp, GCRYSEXP_FMT_ADVANCED, NULL, 0);
-  assert (len);
+  log_assert (len);
   result = xtrymalloc (len);
   if (!result)
     {
@@ -562,7 +662,7 @@ pretty_es_print_sexp (estream_t fp, const unsigned char *buf, size_t buflen)
       return;
     }
   len = gcry_sexp_sprint (sexp, GCRYSEXP_FMT_ADVANCED, result, len);
-  assert (len);
+  log_assert (len);
   for (p = result; len; len--, p++)
     {
       if (*p == '\n')

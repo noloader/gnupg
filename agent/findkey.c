@@ -82,9 +82,10 @@ linefeed_to_percent0A (const char *string)
 
 /* Note: Ownership of FNAME and FP are moved to this function.  */
 static gpg_error_t
-write_extended_private_key (char *fname, estream_t fp, int update,
+write_extended_private_key (char *fname, estream_t fp, int update, int newkey,
                             const void *buf, size_t len,
-                            const char *serialno, const char *keyref)
+                            const char *serialno, const char *keyref,
+                            time_t timestamp)
 {
   gpg_error_t err;
   nvc_t pk = NULL;
@@ -153,6 +154,19 @@ write_extended_private_key (char *fname, estream_t fp, int update,
         }
     }
 
+  /* If a timestamp has been supplied and the key is new write a
+   * creation timestamp.  (We douple check that there is no Created
+   * item yet.)*/
+  if (timestamp && newkey && !nvc_lookup (pk, "Created:"))
+    {
+      gnupg_isotime_t timebuf;
+
+      epoch2isotime (timebuf, timestamp);
+      err = nvc_add (pk, "Created:", timebuf);
+      if (err)
+        goto leave;
+    }
+
 
   err = es_fseek (fp, 0, SEEK_SET);
   if (err)
@@ -199,12 +213,15 @@ write_extended_private_key (char *fname, estream_t fp, int update,
 
 /* Write an S-expression formatted key to our key storage.  With FORCE
  * passed as true an existing key with the given GRIP will get
- * overwritten.  If SERIALNO and KEYREF are given a Token line is added to
- * the key if the extended format is used.  */
+ * overwritten.  If SERIALNO and KEYREF are given a Token line is
+ * added to the key if the extended format is used.  If TIMESTAMP is
+ * not zero and the key doies not yet exists it will be recorded as
+ * creation date.  */
 int
 agent_write_private_key (const unsigned char *grip,
                          const void *buffer, size_t length, int force,
-                         const char *serialno, const char *keyref)
+                         const char *serialno, const char *keyref,
+                         time_t timestamp)
 {
   char *fname;
   estream_t fp;
@@ -272,20 +289,20 @@ agent_write_private_key (const unsigned char *grip,
       if (first != '(')
         {
           /* Key is already in the extended format.  */
-          return write_extended_private_key (fname, fp, 1, buffer, length,
-                                             serialno, keyref);
+          return write_extended_private_key (fname, fp, 1, 0, buffer, length,
+                                             serialno, keyref, timestamp);
         }
       if (first == '(' && opt.enable_extended_key_format)
         {
           /* Key is in the old format - but we want the extended format.  */
-          return write_extended_private_key (fname, fp, 0, buffer, length,
-                                             serialno, keyref);
+          return write_extended_private_key (fname, fp, 0, 0, buffer, length,
+                                             serialno, keyref, timestamp);
         }
     }
 
   if (opt.enable_extended_key_format)
-    return write_extended_private_key (fname, fp, 0, buffer, length,
-                                       serialno, keyref);
+    return write_extended_private_key (fname, fp, 0, 1, buffer, length,
+                                       serialno, keyref, timestamp);
 
   if (es_fwrite (buffer, length, 1, fp) != 1)
     {
@@ -968,7 +985,7 @@ agent_key_from_file (ctrl_t ctrl, const char *cache_nonce,
 {
   gpg_error_t err;
   unsigned char *buf;
-  size_t len, buflen, erroff;
+  size_t len, erroff;
   gcry_sexp_t s_skey;
   nvc_t keymeta = NULL;
   char *desc_text_buffer = NULL;  /* Used in case we extend DESC_TEXT.  */
@@ -1027,7 +1044,7 @@ agent_key_from_file (ctrl_t ctrl, const char *cache_nonce,
         /* Note, that we will take the comment as a C string for
          * display purposes; i.e. all stuff beyond a Nul character is
          * ignored.  If a "Label" entry is available in the meta data
-         * this is used instead of the s-ecpression comment.  */
+         * this is used instead of the s-expression comment.  */
         if (keymeta && (comment = nvc_get_string (keymeta, "Label:")))
           {
             if (strchr (comment, '\n')
@@ -1117,10 +1134,10 @@ agent_key_from_file (ctrl_t ctrl, const char *cache_nonce,
       return err;
     }
 
-  buflen = gcry_sexp_canon_len (buf, 0, NULL, NULL);
-  err = gcry_sexp_sscan (&s_skey, &erroff, (char*)buf, buflen);
-  wipememory (buf, buflen);
+  err = sexp_sscan_private_key (result, &erroff, buf);
   xfree (buf);
+  nvc_release (keymeta);
+  xfree (desc_text_buffer);
   if (err)
     {
       log_error ("failed to build S-Exp (off=%u): %s\n",
@@ -1130,197 +1147,9 @@ agent_key_from_file (ctrl_t ctrl, const char *cache_nonce,
           xfree (*r_passphrase);
           *r_passphrase = NULL;
         }
-      nvc_release (keymeta);
-      xfree (desc_text_buffer);
-      return err;
     }
 
-  *result = s_skey;
-  nvc_release (keymeta);
-  xfree (desc_text_buffer);
-  return 0;
-}
-
-
-/* Return the string name from the S-expression S_KEY as well as a
-   string describing the names of the parameters.  ALGONAMESIZE and
-   ELEMSSIZE give the allocated size of the provided buffers.  The
-   buffers may be NULL if not required.  If R_LIST is not NULL the top
-   level list will be stored there; the caller needs to release it in
-   this case.  */
-static gpg_error_t
-key_parms_from_sexp (gcry_sexp_t s_key, gcry_sexp_t *r_list,
-                     char *r_algoname, size_t algonamesize,
-                     char *r_elems, size_t elemssize)
-{
-  gcry_sexp_t list, l2;
-  const char *name, *algoname, *elems;
-  size_t n;
-
-  if (r_list)
-    *r_list = NULL;
-
-  list = gcry_sexp_find_token (s_key, "shadowed-private-key", 0 );
-  if (!list)
-    list = gcry_sexp_find_token (s_key, "protected-private-key", 0 );
-  if (!list)
-    list = gcry_sexp_find_token (s_key, "private-key", 0 );
-  if (!list)
-    list = gcry_sexp_find_token (s_key, "public-key", 0 );
-  if (!list)
-    {
-      log_error ("invalid private key format\n");
-      return gpg_error (GPG_ERR_BAD_SECKEY);
-    }
-
-  l2 = gcry_sexp_cadr (list);
-  gcry_sexp_release (list);
-  list = l2;
-  name = gcry_sexp_nth_data (list, 0, &n);
-  if (n==3 && !memcmp (name, "rsa", 3))
-    {
-      algoname = "rsa";
-      elems = "ne";
-    }
-  else if (n==3 && !memcmp (name, "dsa", 3))
-    {
-      algoname = "dsa";
-      elems = "pqgy";
-    }
-  else if (n==3 && !memcmp (name, "ecc", 3))
-    {
-      algoname = "ecc";
-      elems = "pabgnq";
-    }
-  else if (n==5 && !memcmp (name, "ecdsa", 5))
-    {
-      algoname = "ecdsa";
-      elems = "pabgnq";
-    }
-  else if (n==4 && !memcmp (name, "ecdh", 4))
-    {
-      algoname = "ecdh";
-      elems = "pabgnq";
-    }
-  else if (n==3 && !memcmp (name, "elg", 3))
-    {
-      algoname = "elg";
-      elems = "pgy";
-    }
-  else
-    {
-      log_error ("unknown private key algorithm\n");
-      gcry_sexp_release (list);
-      return gpg_error (GPG_ERR_BAD_SECKEY);
-    }
-
-  if (r_algoname)
-    {
-      if (strlen (algoname) >= algonamesize)
-        return gpg_error (GPG_ERR_BUFFER_TOO_SHORT);
-      strcpy (r_algoname, algoname);
-    }
-  if (r_elems)
-    {
-      if (strlen (elems) >= elemssize)
-        return gpg_error (GPG_ERR_BUFFER_TOO_SHORT);
-      strcpy (r_elems, elems);
-    }
-
-  if (r_list)
-    *r_list = list;
-  else
-    gcry_sexp_release (list);
-
-  return 0;
-}
-
-
-/* Return true if KEYPARMS holds an EdDSA key.  */
-static int
-is_eddsa (gcry_sexp_t keyparms)
-{
-  int result = 0;
-  gcry_sexp_t list;
-  const char *s;
-  size_t n;
-  int i;
-
-  list = gcry_sexp_find_token (keyparms, "flags", 0);
-  for (i = list ? gcry_sexp_length (list)-1 : 0; i > 0; i--)
-    {
-      s = gcry_sexp_nth_data (list, i, &n);
-      if (!s)
-        continue; /* Not a data element. */
-
-      if (n == 5 && !memcmp (s, "eddsa", 5))
-        {
-          result = 1;
-          break;
-        }
-    }
-  gcry_sexp_release (list);
-  return result;
-}
-
-
-/* Return the public key algorithm number if S_KEY is a DSA style key.
-   If it is not a DSA style key, return 0.  */
-int
-agent_is_dsa_key (gcry_sexp_t s_key)
-{
-  int result;
-  gcry_sexp_t list;
-  char algoname[6];
-
-  if (!s_key)
-    return 0;
-
-  if (key_parms_from_sexp (s_key, &list, algoname, sizeof algoname, NULL, 0))
-    return 0; /* Error - assume it is not an DSA key.  */
-
-  if (!strcmp (algoname, "dsa"))
-    result = GCRY_PK_DSA;
-  else if (!strcmp (algoname, "ecc"))
-    {
-      if (is_eddsa (list))
-        result = 0;
-      else
-        result = GCRY_PK_ECDSA;
-    }
-  else if (!strcmp (algoname, "ecdsa"))
-    result = GCRY_PK_ECDSA;
-  else
-    result = 0;
-
-  gcry_sexp_release (list);
-  return result;
-}
-
-
-/* Return true if S_KEY is an EdDSA key as used with curve Ed25519.  */
-int
-agent_is_eddsa_key (gcry_sexp_t s_key)
-{
-  int result;
-  gcry_sexp_t list;
-  char algoname[6];
-
-  if (!s_key)
-    return 0;
-
-  if (key_parms_from_sexp (s_key, &list, algoname, sizeof algoname, NULL, 0))
-    return 0; /* Error - assume it is not an EdDSA key.  */
-
-  if (!strcmp (algoname, "ecc") && is_eddsa (list))
-    result = 1;
-  else if (!strcmp (algoname, "eddsa")) /* backward compatibility.  */
-    result = 1;
-  else
-    result = 0;
-
-  gcry_sexp_release (list);
-  return result;
+  return err;
 }
 
 
@@ -1508,7 +1337,8 @@ agent_key_available (const unsigned char *grip)
    S-expression.  */
 gpg_error_t
 agent_key_info_from_file (ctrl_t ctrl, const unsigned char *grip,
-                          int *r_keytype, unsigned char **r_shadow_info)
+                          int *r_keytype, unsigned char **r_shadow_info,
+                          unsigned char **r_shadow_info_type)
 {
   gpg_error_t err;
   unsigned char *buf;
@@ -1555,7 +1385,7 @@ agent_key_info_from_file (ctrl_t ctrl, const unsigned char *grip,
           const unsigned char *s;
           size_t n;
 
-          err = agent_get_shadow_info (buf, &s);
+          err = agent_get_shadow_info_type (buf, &s, r_shadow_info_type);
           if (!err)
             {
               n = gcry_sexp_canon_len (s, 0, NULL, NULL);
@@ -1739,7 +1569,7 @@ agent_write_shadow_key (const unsigned char *grip,
     }
 
   len = gcry_sexp_canon_len (shdkey, 0, NULL, NULL);
-  err = agent_write_private_key (grip, shdkey, len, force, serialno, keyid);
+  err = agent_write_private_key (grip, shdkey, len, force, serialno, keyid, 0);
   xfree (shdkey);
   if (err)
     log_error ("error writing key: %s\n", gpg_strerror (err));

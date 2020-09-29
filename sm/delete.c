@@ -24,7 +24,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
-#include <assert.h>
 
 #include "gpgsm.h"
 #include <gcrypt.h>
@@ -54,7 +53,7 @@ delete_one (ctrl_t ctrl, const char *username)
       goto leave;
     }
 
-  kh = keydb_new ();
+  kh = keydb_new (ctrl);
   if (!kh)
     {
       log_error ("keydb_new failed\n");
@@ -81,7 +80,7 @@ delete_one (ctrl_t ctrl, const char *username)
 
     next_ambigious:
       rc = keydb_search (ctrl, kh, &desc, 1);
-      if (rc == -1)
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
         rc = 0;
       else if (!rc)
         {
@@ -105,7 +104,7 @@ delete_one (ctrl_t ctrl, const char *username)
     }
   if (rc)
     {
-      if (rc == -1)
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
         rc = gpg_error (GPG_ERR_NO_PUBKEY);
       log_error (_("certificate '%s' not found: %s\n"),
                  username, gpg_strerror (rc));
@@ -113,7 +112,7 @@ delete_one (ctrl_t ctrl, const char *username)
       goto leave;
     }
 
-  /* We need to search again to get back to the right position.  Neo
+  /* We need to search again to get back to the right position.  Note
    * that the lock is kept until the KH is released.  */
   rc = keydb_lock (kh);
   if (rc)

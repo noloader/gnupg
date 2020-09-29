@@ -263,7 +263,8 @@ gpg_error_t keydb_search_fpr (KEYDB_HANDLE hd, const byte *fpr, size_t fprlen);
 
 /*-- pkclist.c --*/
 void show_revocation_reason (ctrl_t ctrl, PKT_public_key *pk, int mode );
-int  check_signatures_trust (ctrl_t ctrl, PKT_signature *sig);
+gpg_error_t check_signatures_trust (ctrl_t ctrl, kbnode_t keyblock,
+                                    PKT_public_key *pk, PKT_signature *sig);
 
 void release_pk_list (PK_LIST pk_list);
 int expand_id (const char *id, strlist_t *into, unsigned int flags);
@@ -552,6 +553,7 @@ const char *colon_datestr_from_pk (PKT_public_key *pk);
 const char *colon_datestr_from_sig (PKT_signature *sig);
 const char *colon_expirestr_from_sig (PKT_signature *sig);
 byte *fingerprint_from_pk( PKT_public_key *pk, byte *buf, size_t *ret_len );
+void fpr20_from_pk (PKT_public_key *pk, byte array[20]);
 char *hexfingerprint (PKT_public_key *pk, char *buffer, size_t buflen);
 char *format_hexfingerprint (const char *fingerprint,
                              char *buffer, size_t buflen);

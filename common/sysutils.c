@@ -40,6 +40,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <limits.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <errno.h>
 #ifdef HAVE_STAT
@@ -54,6 +56,10 @@
 # include <sys/time.h>
 # include <sys/resource.h>
 #endif
+#ifdef HAVE_PWD_H
+# include <pwd.h>
+# include <grp.h>
+#endif /*HAVE_PWD_H*/
 #ifdef HAVE_W32_SYSTEM
 # if WINVER < 0x0500
 #   define WINVER 0x0500  /* Required for AllowSetForegroundWindow.  */
@@ -743,32 +749,37 @@ gnupg_rename_file (const char *oldname, const char *newname, int *block_signals)
 
 #ifndef HAVE_W32_SYSTEM
 static mode_t
-modestr_to_mode (const char *modestr)
+modestr_to_mode (const char *modestr, mode_t oldmode)
 {
+  static struct {
+    char letter;
+    mode_t value;
+  } table[] = { { '-', 0 },
+                { 'r', S_IRUSR }, { 'w', S_IWUSR }, { 'x', S_IXUSR },
+                { 'r', S_IRGRP }, { 'w', S_IWGRP }, { 'x', S_IXGRP },
+                { 'r', S_IROTH }, { 'w', S_IWOTH }, { 'x', S_IXOTH } };
+  int idx;
   mode_t mode = 0;
 
-  if (modestr && *modestr)
+  /* For now we only support a string as used by ls(1) and no octal
+   * numbers.  The first character must be a dash.  */
+  for (idx=0; idx < 10 && *modestr; idx++, modestr++)
     {
-      modestr++;
-      if (*modestr && *modestr++ == 'r')
-        mode |= S_IRUSR;
-      if (*modestr && *modestr++ == 'w')
-        mode |= S_IWUSR;
-      if (*modestr && *modestr++ == 'x')
-        mode |= S_IXUSR;
-      if (*modestr && *modestr++ == 'r')
-        mode |= S_IRGRP;
-      if (*modestr && *modestr++ == 'w')
-        mode |= S_IWGRP;
-      if (*modestr && *modestr++ == 'x')
-        mode |= S_IXGRP;
-      if (*modestr && *modestr++ == 'r')
-        mode |= S_IROTH;
-      if (*modestr && *modestr++ == 'w')
-        mode |= S_IWOTH;
-      if (*modestr && *modestr++ == 'x')
-        mode |= S_IXOTH;
+      if (*modestr == table[idx].letter)
+        mode |= table[idx].value;
+      else if (*modestr == '.')
+        {
+          if (!idx)
+            ;  /* Skip the dummy.  */
+          else if ((oldmode & table[idx].value))
+            mode |= (oldmode & table[idx].value);
+          else
+            mode &= ~(oldmode & table[idx].value);
+        }
+      else if (*modestr != '-')
+        break;
     }
+
 
   return mode;
 }
@@ -789,29 +800,9 @@ modestr_to_mode (const char *modestr)
 int
 gnupg_mkdir (const char *name, const char *modestr)
 {
-#ifdef HAVE_W32CE_SYSTEM
-  wchar_t *wname;
-  (void)modestr;
-
-  wname = utf8_to_wchar (name);
-  if (!wname)
-    return -1;
-  if (!CreateDirectoryW (wname, NULL))
-    {
-      xfree (wname);
-      return -1;  /* ERRNO is automagically provided by gpg-error.h.  */
-    }
-  xfree (wname);
-  return 0;
-#elif MKDIR_TAKES_ONE_ARG
-  (void)modestr;
-  /* Note: In the case of W32 we better use CreateDirectory and try to
-     set appropriate permissions.  However using mkdir is easier
-     because this sets ERRNO.  */
-  return mkdir (name);
-#else
-  return mkdir (name, modestr_to_mode (modestr));
-#endif
+  /* Note that gpgrt_mkdir also sets ERRNO in addition to returing an
+   * gpg-error style error code.  */
+  return gpgrt_mkdir (name, modestr);
 }
 
 
@@ -820,14 +811,17 @@ gnupg_mkdir (const char *name, const char *modestr)
 int
 gnupg_chdir (const char *name)
 {
-  return chdir (name);
+  /* Note that gpgrt_chdir also sets ERRNO in addition to returing an
+   * gpg-error style error code.  */
+  return gpgrt_chdir (name);
 }
 
 
 /* A wrapper around chmod which takes a string for the mode argument.
    This makes it easier to handle the mode argument which is not
    defined on all systems.  The format of the modestring is the same
-   as for gnupg_mkdir.  */
+   as for gnupg_mkdir with extra feature that a '.' keeps the original
+   mode bit.  */
 int
 gnupg_chmod (const char *name, const char *modestr)
 {
@@ -836,7 +830,19 @@ gnupg_chmod (const char *name, const char *modestr)
   (void)modestr;
   return 0;
 #else
-  return chmod (name, modestr_to_mode (modestr));
+  mode_t oldmode;
+  if (strchr (modestr, '.'))
+    {
+      /* Get the old mode so that a '.' can copy that bit.  */
+      struct stat st;
+
+      if (stat (name, &st))
+        return -1;
+      oldmode = st.st_mode;
+    }
+  else
+    oldmode = 0;
+  return chmod (name, modestr_to_mode (modestr, oldmode));
 #endif
 }
 
@@ -1051,6 +1057,98 @@ gnupg_getcwd (void)
       size *= 2;
 #endif
     }
+}
+
+
+/* Try to set an envvar.  Print only a notice on error.  */
+static void
+try_set_envvar (const char *name, const char *value, int silent)
+{
+  if (gnupg_setenv (name, value, 1))
+    if (!silent)
+      log_info ("error setting envvar %s to '%s': %s\n", name, value,
+                gpg_strerror (my_error_from_syserror ()));
+}
+
+
+/* Switch to USER which is either a name or an UID.  This is a nop
+ * under Windows.  Note that in general it is only possible to switch
+ * to another user id if the process is running under root.  if silent
+ * is set no diagnostics are printed.  */
+gpg_error_t
+gnupg_chuid (const char *user, int silent)
+{
+#ifdef HAVE_W32_SYSTEM
+  (void)user;  /* Not implemented for Windows - ignore.  */
+  (void)silent;
+  return 0;
+
+#elif HAVE_PWD_H /* A proper Unix  */
+  unsigned long ul;
+  struct passwd *pw;
+  struct stat st;
+  char *endp;
+  gpg_error_t err;
+
+  gpg_err_set_errno (0);
+  ul = strtoul (user, &endp, 10);
+  if (errno || endp == user || *endp)
+    pw = getpwnam (user);  /* Not a number; assume USER is a name.  */
+  else
+    pw = getpwuid ((uid_t)ul);
+
+  if (!pw)
+    {
+      if (!silent)
+        log_error ("user '%s' not found\n", user);
+      return my_error (GPG_ERR_NOT_FOUND);
+    }
+
+  /* Try to set some envvars even if we are already that user.  */
+  if (!stat (pw->pw_dir, &st))
+    try_set_envvar ("HOME", pw->pw_dir, silent);
+
+  try_set_envvar ("USER", pw->pw_name, silent);
+  try_set_envvar ("LOGNAME", pw->pw_name, silent);
+#ifdef _AIX
+  try_set_envvar ("LOGIN", pw->pw_name, silent);
+#endif
+
+  if (getuid () == pw->pw_uid)
+    return 0;  /* We are already this user.  */
+
+  /* If we need to switch set PATH to a standard value and make sure
+   * GNUPGHOME is not set. */
+  try_set_envvar ("PATH", "/usr/local/bin:/usr/bin:/bin", silent);
+  if (gnupg_unsetenv ("GNUPGHOME"))
+    if (!silent)
+      log_info ("error unsetting envvar %s: %s\n", "GNUPGHOME",
+                gpg_strerror (gpg_error_from_syserror ()));
+
+  if (initgroups (pw->pw_name, pw->pw_gid))
+    {
+      err = my_error_from_syserror ();
+      if (!silent)
+        log_error ("error setting supplementary groups for '%s': %s\n",
+                   pw->pw_name, gpg_strerror (err));
+      return err;
+    }
+
+  if (setuid (pw->pw_uid))
+    {
+      err = my_error_from_syserror ();
+      log_error ("error switching to user '%s': %s\n",
+                 pw->pw_name, gpg_strerror (err));
+      return err;
+    }
+
+  return 0;
+
+#else /*!HAVE_PWD_H */
+  if (!silent)
+    log_info ("system is missing passwd querying functions\n");
+  return my_error (GPG_ERR_NOT_IMPLEMENTED);
+#endif
 }
 
 

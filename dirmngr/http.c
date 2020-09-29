@@ -765,10 +765,9 @@ http_session_new (http_session_t *r_session,
                     && !ascii_strcasecmp (intended_hostname,
                                           get_default_keyserver (1)));
 
-    /* If the user has not specified a CA list, and they are looking
-     * for the hkps pool from sks-keyservers.net, then default to
-     * Kristian's certificate authority:  */
-    if (!tls_ca_certlist && is_hkps_pool)
+    /* If we are looking for the hkps pool from sks-keyservers.net,
+     * then forcefully use its dedicated certificate authority.  */
+    if (is_hkps_pool)
       {
         char *pemname = make_filename_try (gnupg_datadir (),
                                            "sks-keyservers.netCA.pem", NULL);
@@ -788,11 +787,12 @@ http_session_new (http_session_t *r_session,
             xfree (pemname);
           }
 
-        add_system_cas = 0;
+        if (is_hkps_pool)
+          add_system_cas = 0;
       }
 
     /* Add configured certificates to the session.  */
-    if ((flags & HTTP_FLAG_TRUST_DEF))
+    if ((flags & HTTP_FLAG_TRUST_DEF) && !is_hkps_pool)
       {
         for (sl = tls_ca_certlist; sl; sl = sl->next)
           {
@@ -803,7 +803,10 @@ http_session_new (http_session_t *r_session,
               log_info ("setting CA from file '%s' failed: %s\n",
                         sl->d, gnutls_strerror (rc));
           }
-        if (!tls_ca_certlist && !is_hkps_pool)
+
+        /* If HKP trust is requested and there are no HKP certificates
+         * configured, also try the standard system certificates.  */
+        if (!tls_ca_certlist)
           add_system_cas = 1;
       }
 
@@ -825,7 +828,7 @@ http_session_new (http_session_t *r_session,
       }
 
     /* Add other configured certificates to the session.  */
-    if ((flags & HTTP_FLAG_TRUST_CFG))
+    if ((flags & HTTP_FLAG_TRUST_CFG) && !is_hkps_pool)
       {
         for (sl = cfg_ca_certlist; sl; sl = sl->next)
           {
@@ -2056,6 +2059,14 @@ send_request (ctrl_t ctrl, http_t hd, const char *httphost, const char *auth,
 
       while ((err = ntbtls_handshake (hd->session->tls_session)))
         {
+#if NTBTLS_VERSION_NUMBER >= 0x000200
+          unsigned int tlevel, ttype;
+          const char *s = ntbtls_get_last_alert (hd->session->tls_session,
+                                                 &tlevel, &ttype);
+          if (s)
+            log_info ("TLS alert: %s (%u.%u)\n", s, tlevel, ttype);
+#endif
+
           switch (err)
             {
             default:
@@ -3005,6 +3016,15 @@ connect_server (ctrl_t ctrl, const char *server, unsigned short port,
           sock = my_sock_new_for_addr (ai->addr, ai->socktype, ai->protocol);
           if (sock == ASSUAN_INVALID_FD)
             {
+              if (errno == EAFNOSUPPORT)
+                {
+                  if (ai->family == AF_INET)
+                    v4_valid = 0;
+                  if (ai->family == AF_INET6)
+                    v6_valid = 0;
+                  continue;
+                }
+
               err = gpg_err_make (default_errsource,
                                   gpg_err_code_from_syserror ());
               log_error ("error creating socket: %s\n", gpg_strerror (err));

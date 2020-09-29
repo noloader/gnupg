@@ -106,6 +106,7 @@ enum cmd_and_opt_values {
   oDebugAllowCoreDump,
   oDebugNoChainValidation,
   oDebugIgnoreExpiration,
+  oDebugForceECDHSHA1KDF,
   oLogFile,
   oNoLogFile,
   oAuditLog,
@@ -199,6 +200,9 @@ enum cmd_and_opt_values {
   oIgnoreCertExtension,
   oAuthenticode,
   oAttribute,
+  oChUid,
+  oUseKeyboxd,
+  oKeyboxdProgram,
   oNoAutostart
  };
 
@@ -270,6 +274,7 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_n (oDebugAllowCoreDump, "debug-allow-core-dump", "@"),
   ARGPARSE_s_n (oDebugNoChainValidation, "debug-no-chain-validation", "@"),
   ARGPARSE_s_n (oDebugIgnoreExpiration,  "debug-ignore-expiration", "@"),
+  ARGPARSE_s_n (oDebugForceECDHSHA1KDF,  "debug-force-ecdh-sha1kdf", "@"),
   ARGPARSE_s_s (oLogFile, "log-file",
                 N_("|FILE|write server mode logs to FILE")),
   ARGPARSE_s_n (oNoLogFile, "no-log-file", "@"),
@@ -293,6 +298,7 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_s (oIgnoreCertExtension, "ignore-cert-extension", "@"),
   ARGPARSE_s_n (oNoAutostart, "no-autostart", "@"),
   ARGPARSE_s_s (oAgentProgram, "agent-program", "@"),
+  ARGPARSE_s_s (oKeyboxdProgram, "keyboxd-program", "@"),
   ARGPARSE_s_s (oDirmngrProgram, "dirmngr-program", "@"),
   ARGPARSE_s_s (oProtectToolProgram, "protect-tool-program", "@"),
 
@@ -340,6 +346,7 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_n (oNoDefKeyring, "no-default-keyring", "@"),
   ARGPARSE_s_s (oKeyServer, "keyserver",
                 N_("|SPEC|use this keyserver to lookup keys")),
+  ARGPARSE_s_n (oUseKeyboxd,    "use-keyboxd", "@"),
 
 
   ARGPARSE_header ("ImportExport",
@@ -424,6 +431,7 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_s (oLCctype,    "lc-ctype", "@"),
   ARGPARSE_s_s (oLCmessages, "lc-messages", "@"),
   ARGPARSE_s_s (oXauthority, "xauthority", "@"),
+  ARGPARSE_s_s (oChUid, "chuid", "@"),
 
 
   ARGPARSE_header (NULL, ""),  /* Stop the header group.  */
@@ -510,6 +518,7 @@ our_pk_test_algo (int algo)
     {
     case GCRY_PK_RSA:
     case GCRY_PK_ECDSA:
+    case GCRY_PK_EDDSA:
       return gcry_pk_test_algo (algo);
     default:
       return 1;
@@ -950,6 +959,7 @@ parse_keyserver_line (char *line,
 int
 main ( int argc, char **argv)
 {
+  gpg_error_t err = 0;
   gpgrt_argparse_t pargs;
   int orig_argc;
   char **orig_argv;
@@ -986,7 +996,10 @@ main ( int argc, char **argv)
   estream_t htmlauditfp = NULL;
   struct assuan_malloc_hooks malloc_hooks;
   int pwfd = -1;
-  /*mtrace();*/
+
+  static const char *homedirvalue;
+  static const char *changeuser;
+
 
   early_system_init ();
   gnupg_reopen_std (GPGSM_NAME);
@@ -1055,7 +1068,11 @@ main ( int argc, char **argv)
           break;
 
         case oHomedir:
-          gnupg_set_homedir (pargs.r.ret_str);
+          homedirvalue = pargs.r.ret_str;
+          break;
+
+        case oChUid:
+          changeuser = pargs.r.ret_str;
           break;
 
         case aCallProtectTool:
@@ -1074,7 +1091,7 @@ main ( int argc, char **argv)
 
   /*
      Now we are now working under our real uid
-  */
+   */
 
   ksba_set_malloc_hooks (gcry_malloc, gcry_realloc, gcry_free );
 
@@ -1084,6 +1101,11 @@ main ( int argc, char **argv)
   assuan_set_malloc_hooks (&malloc_hooks);
   assuan_set_gpg_err_source (GPG_ERR_SOURCE_DEFAULT);
   setup_libassuan_logging (&opt.debug, NULL);
+
+  /* Change UID and then set homedir.  */
+  if (changeuser && gnupg_chuid (changeuser, 0))
+    log_inc_errorcount (); /* Force later termination.  */
+  gnupg_set_homedir (homedirvalue);
 
   /* Setup a default control structure for command line mode */
   memset (&ctrl, 0, sizeof ctrl);
@@ -1133,6 +1155,7 @@ main ( int argc, char **argv)
 	case aGPGConfTest:
           set_cmd (&cmd, pargs.r_opt);
           do_not_setup_keys = 1;
+          default_keyring = 0;
           nogreeting = 1;
           break;
 
@@ -1337,6 +1360,7 @@ main ( int argc, char **argv)
         case oAnswerNo: opt.answer_no = 1; break;
 
         case oKeyring: append_to_strlist (&nrings, pargs.r.ret_str); break;
+        case oUseKeyboxd: opt.use_keyboxd = 1; break;
 
         case oDebug:
           if (parse_debug_flag (pargs.r.ret_str, &debug_value, debug_flags))
@@ -1354,6 +1378,7 @@ main ( int argc, char **argv)
           break;
         case oDebugNoChainValidation: opt.no_chain_validation = 1; break;
         case oDebugIgnoreExpiration: opt.ignore_expiration = 1; break;
+        case oDebugForceECDHSHA1KDF: opt.force_ecdh_sha1kdf = 1; break;
 
         case oStatusFD:
             ctrl.status_fd = translate_sys2libc_fd_int (pargs.r.ret_int, 1);
@@ -1378,7 +1403,9 @@ main ( int argc, char **argv)
           break;
 
         case oHomedir: gnupg_set_homedir (pargs.r.ret_str); break;
+        case oChUid: break;  /* Command line only (see above).  */
         case oAgentProgram: opt.agent_program = pargs.r.ret_str;  break;
+        case oKeyboxdProgram: opt.keyboxd_program = pargs.r.ret_str;  break;
 
         case oDisplay:
           set_opt_session_env ("DISPLAY", pargs.r.ret_str);
@@ -1768,7 +1795,7 @@ main ( int argc, char **argv)
     }
 
   /* Add default keybox. */
-  if (!nrings && default_keyring)
+  if (!nrings && default_keyring && !opt.use_keyboxd)
     {
       int created;
 
@@ -1789,8 +1816,11 @@ main ( int argc, char **argv)
           xfree (filelist[0]);
         }
     }
-  for (sl = nrings; sl; sl = sl->next)
-    keydb_add_resource (&ctrl, sl->d, 0, NULL);
+  if (!opt.use_keyboxd)
+    {
+      for (sl = nrings; sl; sl = sl->next)
+        keydb_add_resource (&ctrl, sl->d, 0, NULL);
+    }
   FREE_STRLIST(nrings);
 
 
@@ -1919,13 +1949,21 @@ main ( int argc, char **argv)
         set_binary (stdin);
 
         if (!argc) /* Source is stdin. */
-          gpgsm_encrypt (&ctrl, recplist, 0, fp);
+          err = gpgsm_encrypt (&ctrl, recplist, 0, fp);
         else if (argc == 1)  /* Source is the given file. */
-          gpgsm_encrypt (&ctrl, recplist, open_read (*argv), fp);
+          err = gpgsm_encrypt (&ctrl, recplist, open_read (*argv), fp);
         else
           wrong_args ("--encrypt [datafile]");
 
+#if GPGRT_VERSION_NUMBER >= 0x012700 /* >= 1.39 */
+        if (err)
+          gpgrt_fcancel (fp);
+        else
+          es_fclose (fp);
+#else
+        (void)err;
         es_fclose (fp);
+#endif
       }
       break;
 
@@ -1937,14 +1975,22 @@ main ( int argc, char **argv)
            signing because that is what gpg does.*/
         set_binary (stdin);
         if (!argc) /* Create from stdin. */
-          gpgsm_sign (&ctrl, signerlist, 0, detached_sig, fp);
+          err = gpgsm_sign (&ctrl, signerlist, 0, detached_sig, fp);
         else if (argc == 1) /* From file. */
-          gpgsm_sign (&ctrl, signerlist,
+          err = gpgsm_sign (&ctrl, signerlist,
                       open_read (*argv), detached_sig, fp);
         else
           wrong_args ("--sign [datafile]");
 
+#if GPGRT_VERSION_NUMBER >= 0x012700 /* >= 1.39 */
+        if (err)
+          gpgrt_fcancel (fp);
+        else
+          es_fclose (fp);
+#else
+        (void)err;
         es_fclose (fp);
+#endif
       }
       break;
 
@@ -2192,6 +2238,7 @@ main ( int argc, char **argv)
     }
 
   /* cleanup */
+  gpgsm_deinit_default_ctrl (&ctrl);
   keyserver_list_free (opt.keyserver);
   opt.keyserver = NULL;
   gpgsm_release_certlist (recplist);
@@ -2234,6 +2281,15 @@ gpgsm_init_default_ctrl (struct server_control_s *ctrl)
   ctrl->use_ocsp = opt.enable_ocsp;
   ctrl->validation_model = default_validation_model;
   ctrl->offline = opt.disable_dirmngr;
+}
+
+
+/* This function is called to deinitialize a control object.  The
+ * control object is is not released, though.  */
+void
+gpgsm_deinit_default_ctrl (ctrl_t ctrl)
+{
+  gpgsm_keydb_deinit_session_data (ctrl);
 }
 
 

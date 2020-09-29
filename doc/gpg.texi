@@ -453,6 +453,11 @@ Don't send your complete keyring to a keyserver --- select
 only those keys which are new or changed by you.  If no @var{keyIDs}
 are given, @command{@gpgname} does nothing.
 
+Take care: Keyservers are by design write only systems and thus it is
+not possible to ever delete keys once they have been send to a
+keyserver.
+
+
 @item --export-secret-keys
 @itemx --export-secret-subkeys
 @opindex export-secret-keys
@@ -2243,11 +2248,32 @@ Use @var{name} as the key to sign with. Note that this option overrides
 @item --sender @var{mbox}
 @opindex sender
 This option has two purposes.  @var{mbox} must either be a complete
-user id with a proper mail address or just a mail address.  When
-creating a signature this option tells gpg the user id of a key used
-to make a signature if the key was not directly specified by a user
-id.  When verifying a signature the @var{mbox} is used to restrict the
-information printed by the TOFU code to matching user ids.
+user ID containing a proper mail address or just a plain mail address.
+The option can be given multiple times.
+
+When creating a signature this option tells gpg the signing key's user
+id used to make the signature and embeds that user ID into the created
+signature (using OpenPGP's ``Signer's User ID'' subpacket).  If the
+option is given multiple times a suitable user ID is picked.  However,
+if the signing key was specified directly by using a mail address
+(i.e. not by using a fingerprint or key ID) this option is used and
+the mail address is embedded in the created signature.
+
+When verifying a signature @var{mbox} is used to restrict the
+information printed by the TOFU code to matching user IDs.  If the
+option is used and the signature contains a ``Signer's User ID''
+subpacket that information is is also used to restrict the printed
+information.  Note that GnuPG considers only the mail address part of
+a User ID.
+
+If this option or the said subpacket is available the TRUST lines as
+printed by option @option{status-fd} correspond to the corresponding
+User ID; if no User ID is known the TRUST lines are computed directly
+on the key and do not give any information about the User ID.  In the
+latter case it his highly recommended to scripts and other frontends
+to evaluate the VALIDSIG line, retrieve the key and print all User IDs
+along with their validity (trust) information.
+
 
 @item --try-secret-key @var{name}
 @opindex try-secret-key
@@ -2422,6 +2448,10 @@ opposite meaning. The options are:
   After import, fix various problems with the
   keys.  For example, this reorders signatures, and strips duplicate
   signatures.  Defaults to yes.
+
+  @item bulk-import
+  When used with --use-keyboxd do the import within a single
+  transaction.  This is an experimental feature.
 
   @item import-minimal
   Import the smallest key possible. This removes all signatures except
@@ -3247,7 +3277,10 @@ default. @option{--no-escape-from-lines} disables this option.
 @opindex passphrase-repeat
 Specify how many times @command{@gpgname} will request a new
 passphrase be repeated.  This is useful for helping memorize a
-passphrase.  Defaults to 1 repetition.
+passphrase.  Defaults to 1 repetition; can be set to 0 to disable any
+passphrase repetition.  Note that a @var{n} greater than 1 will pop up
+the pinentry window @var{n}+1 times even if a modern pinentry with
+two entry fields is used.
 
 @item --passphrase-fd @var{n}
 @opindex passphrase-fd
@@ -3596,6 +3629,16 @@ on the configuration file.
 @c OpenPGP card while several cards are available.  This option might be
 @c removed if it turns out that nobody requires it.
 
+@item --chuid @var{uid}
+@opindex chuid
+Change the current user to @var{uid} which may either be a number or a
+name.  This can be used from the root account to run gpg for
+another user.  If @var{uid} is not the current UID a standard PATH is
+set and the envvar GNUPGHOME is unset.  To override the latter the
+option @option{--homedir} can be used.  This option has only an effect
+when used on the command line.  This option has currently no effect at
+all on Windows.
+
 @end table
 
 @c *******************************
@@ -3692,26 +3735,54 @@ files; They all live in the current home directory (@pxref{option
 
   @item ~/.gnupg/pubring.gpg
   @efindex pubring.gpg
-  The public keyring.  You should backup this file.
+  The public keyring using a legacy format.  You should backup this file.
+
+  If this file is not available, @command{gpg} defaults to the new
+  keybox format and creates a file @file{pubring.kbx} unless that file
+  already exists in which case that file will also be used for OpenPGP
+  keys.
+
+  Note that in the case that both files, @file{pubring.gpg} and
+  @file{pubring.kbx} exists but the latter has no OpenPGP keys, the
+  legacy file @file{pubring.gpg} will be used.  Take care: GnuPG
+  versions before 2.1 will always use the file @file{pubring.gpg}
+  because they do not know about the new keybox format. In the case
+  that you have to use GnuPG 1.4 to decrypt archived data you should
+  keep this file.
 
   @item ~/.gnupg/pubring.gpg.lock
   The lock file for the public keyring.
 
   @item ~/.gnupg/pubring.kbx
   @efindex pubring.kbx
-  The public keyring using a different format.  This file is shared
-  with @command{gpgsm}.  You should backup this file.
+  The public keyring using the new keybox format.  This file is shared
+  with @command{gpgsm}.  You should backup this file.  See above for
+  the relation between this file and it predecessor.
+
+  To convert an existing @file{pubring.gpg} file to the keybox format, you
+  first backup the ownertrust values, then rename @file{pubring.gpg} to
+  @file{publickeys.backup}, so it won’t be recognized by any GnuPG version,
+  run import, and finally restore the ownertrust values:
+
+  @example
+  $ cd ~/.gnupg
+  $ gpg --export-ownertrust >otrust.lst
+  $ mv pubring.gpg publickeys.backup
+  $ gpg --import-options restore --import publickeys.backups
+  $ gpg --import-ownertrust otrust.lst
+  @end example
 
   @item ~/.gnupg/pubring.kbx.lock
   The lock file for @file{pubring.kbx}.
 
   @item ~/.gnupg/secring.gpg
   @efindex secring.gpg
-  A secret keyring as used by GnuPG versions before 2.1.  It is not
-  used by GnuPG 2.1 and later.
+  The legacy secret keyring as used by GnuPG versions before 2.1.  It is not
+  used by GnuPG 2.1 and later.  You may want to keep it in case you
+  have to use GnuPG 1.4 to decrypt archived data.
 
   @item ~/.gnupg/secring.gpg.lock
-  The lock file for the secret keyring.
+  The lock file for the legacy secret keyring.
 
   @item ~/.gnupg/.gpg-v21-migrated
   @efindex .gpg-v21-migrated

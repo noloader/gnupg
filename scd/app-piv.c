@@ -526,7 +526,7 @@ add_tlv (unsigned char *buffer, unsigned int tag, size_t length)
 }
 
 
-/* Function to build a list of TLV and return the result in a mallcoed
+/* Function to build a list of TLV and return the result in a malloced
  * buffer.  The varargs are tuples of (int,size_t,void) each with the
  * tag, the length and the actual data.  A (0,0,NULL) tuple terminates
  * the list.  Up to 10 tuples are supported.  If SECMEM is true the
@@ -1180,7 +1180,7 @@ do_learn_status (app_t app, ctrl_t ctrl, unsigned int flags)
  * R_CERT and the length of the certificate stored at R_CERTLEN.  If
  * on success a non-zero value is stored at R_MECHANISM, the returned
  * data is not a certificate but a public key (in the format used by the
- * container '7f49'.  */
+ * container '7f49').  */
 static gpg_error_t
 readcert_by_tag (app_t app, unsigned int tag,
                  unsigned char **r_cert, size_t *r_certlen, int *r_mechanism)
@@ -1331,7 +1331,7 @@ get_keygrip_by_tag (app_t app, unsigned int tag,
       err = ksba_cert_init_from_mem (cert, certbuf, certbuflen);
       if (err)
         goto leave;
-      err = app_help_get_keygrip_string (cert, *r_keygripstr, NULL);
+      err = app_help_get_keygrip_string (cert, *r_keygripstr, NULL, NULL);
     }
 
  leave:
@@ -1538,8 +1538,10 @@ do_readkey (app_t app, ctrl_t ctrl, const char *keyrefstr, unsigned int flags,
       char keygripstr[KEYGRIP_LEN*2+1];
       char idbuf[50];
       const char *usage;
+      char *algostr;
 
-      err = app_help_get_keygrip_string_pk (pk, pklen, keygripstr, NULL);
+      err = app_help_get_keygrip_string_pk (pk, pklen, keygripstr,
+                                            NULL, NULL, &algostr);
       if (err)
         {
           log_error ("app_help_get_keygrip_string_pk failed: %s\n",
@@ -1553,7 +1555,10 @@ do_readkey (app_t app, ctrl_t ctrl, const char *keyrefstr, unsigned int flags,
                         keygripstr, strlen (keygripstr),
                         idbuf, strlen (idbuf),
                         usage, strlen (usage),
+                        "-", (size_t)1,
+                        algostr, strlen (algostr),
                         NULL, (size_t)0);
+      xfree (algostr);
     }
 
   if (r_pk && r_pklen)
@@ -2284,6 +2289,14 @@ do_sign (app_t app, ctrl_t ctrl, const char *keyidstr, int hashalgo,
           indatalen -= oidbuflen;
         }
     }
+  else if (mechanism == PIV_ALGORITHM_RSA
+           && indatalen == 2048/8 && indata[indatalen-1] == 0xBC)
+    {
+      /* If the provided data length matches the supported RSA
+       * framelen and the last octet of the data is 0xBC, we assume
+       * this is PSS formatted data and we use it verbatim; PIV cards
+       * accept PSS as well as PKCS#1.  */
+    }
   else if (mechanism == PIV_ALGORITHM_RSA)
     {
       /* PIV requires 2048 bit RSA.  */
@@ -2471,7 +2484,8 @@ do_sign (app_t app, ctrl_t ctrl, const char *keyidstr, int hashalgo,
  * between AUTH and SIGN is that AUTH expects that pkcs#1.5 padding
  * for RSA has already been done (digestInfo part w/o the padding)
  * whereas SIGN may accept a plain digest and does the padding if
- * needed.  This is also the reason why SIGN takes a hashalgo. */
+ * needed.  This is also the reason why SIGN takes a hashalgo.  For
+ * both it is also acceptable to receive fully prepared PSS data.  */
 static gpg_error_t
 do_auth (app_t app, ctrl_t ctrl, const char *keyidstr,
          gpg_error_t (*pincb)(void*, const char *, char **),
@@ -3346,6 +3360,66 @@ do_genkey (app_t app, ctrl_t ctrl, const char *keyrefstr, const char *keytype,
 }
 
 
+
+/* Map some names to an OID.  */
+static const unsigned char *
+map_curve_name_to_oid (const unsigned char *name, size_t *namelenp)
+{
+  if (*namelenp == 8 && !memcmp (name, "nistp256", 8))
+    {
+      *namelenp = 19;
+      return "1.2.840.10045.3.1.7";
+    }
+  if (*namelenp == 8 && !memcmp (name, "nistp384", 8))
+    {
+      *namelenp = 12;
+      return "1.3.132.0.34";
+    }
+  if (*namelenp == 8 && !memcmp (name, "nistp521", 8))
+    {
+      *namelenp = 12;
+      return "1.3.132.0.35";
+    }
+  return name;
+}
+
+
+/* Communication object for my_cmp_public_key. */
+struct my_cmp_public_key_parm_s {
+  int curve_seen;
+};
+
+/* Compare function used with cmp_canon_sexp.  */
+static int
+my_cmp_public_key (void *opaque, int depth,
+                   const unsigned char *aval, size_t alen,
+                   const unsigned char *bval, size_t blen)
+{
+  struct my_cmp_public_key_parm_s *parm = opaque;
+
+  (void)depth;
+
+  if (parm->curve_seen)
+    {
+      /* Last token was "curve" - canonicalize its argument.  */
+      parm->curve_seen = 0;
+      aval = map_curve_name_to_oid (aval, &alen);
+      bval = map_curve_name_to_oid (bval, &blen);
+    }
+  else if (alen == 5 && !memcmp (aval, "curve", 5))
+    parm->curve_seen = 1;
+  else
+    parm->curve_seen = 0;
+
+  if (alen > blen)
+    return 1;
+  else if (alen < blen)
+    return -1;
+  else
+    return memcmp (aval, bval, alen);
+}
+
+
 /* Write the certificate (CERT,CERTLEN) to the card at CERTREFSTR.
  * CERTREFSTR is either the OID of the certificate's container data
  * object or of the form "PIV.<two_hexdigit_keyref>". */
@@ -3361,6 +3435,7 @@ do_writecert (app_t app, ctrl_t ctrl,
   unsigned char *pk = NULL;
   unsigned char *orig_pk = NULL;
   size_t pklen, orig_pklen;
+  struct my_cmp_public_key_parm_s cmp_parm = { 0 };
 
   (void)ctrl;
   (void)pincb;     /* Not used; instead authentication is needed.  */
@@ -3394,7 +3469,8 @@ do_writecert (app_t app, ctrl_t ctrl,
   err = app_help_pubkey_from_cert (cert, certlen, &pk, &pklen);
   if (err)
     goto leave;  /* No public key in new certificate. */
-  if (orig_pklen != pklen || memcmp (orig_pk, pk, pklen))
+  if (cmp_canon_sexp (orig_pk, orig_pklen, pk, pklen,
+                      my_cmp_public_key, &cmp_parm))
     {
       err = gpg_error (GPG_ERR_CONFLICT);
       goto leave;

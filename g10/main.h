@@ -41,13 +41,7 @@
 # define DEFAULT_CIPHER_ALGO     CIPHER_ALGO_3DES
 #endif
 
-/* We will start using OCB mode by default only if the yet to be
- * released libgcrypt 1.9 is used.  */
-#if GCRYPT_VERSION_NUMBER < 0x010900
-# define DEFAULT_AEAD_ALGO  AEAD_ALGO_OCB
-#else
-# define DEFAULT_AEAD_ALGO  AEAD_ALGO_EAX
-#endif
+#define DEFAULT_AEAD_ALGO  AEAD_ALGO_OCB
 
 #define DEFAULT_DIGEST_ALGO     ((GNUPG)? DIGEST_ALGO_SHA256:DIGEST_ALGO_SHA1)
 #define DEFAULT_S2K_DIGEST_ALGO DIGEST_ALGO_SHA1
@@ -214,6 +208,8 @@ void write_status_printf (int no, const char *format,
                           ...) GPGRT_ATTR_PRINTF(2,3);
 void write_status_strings (int no, const char *text,
                            ...) GPGRT_ATTR_SENTINEL(0);
+gpg_error_t write_status_strings2 (ctrl_t dummy, int no,
+                                   ...) GPGRT_ATTR_SENTINEL(0);
 void write_status_buffer ( int no,
                            const char *buffer, size_t len, int wrap );
 void write_status_text_and_buffer ( int no, const char *text,
@@ -240,7 +236,7 @@ int  cpr_get_answer_okay_cancel (const char *keyword,
 void display_online_help( const char *keyword );
 
 /*-- encode.c --*/
-int setup_symkey (STRING2KEY **symkey_s2k,DEK **symkey_dek);
+gpg_error_t setup_symkey (STRING2KEY **symkey_s2k,DEK **symkey_dek);
 gpg_error_t encrypt_seskey (DEK *dek, aead_algo_t aead_algo, DEK **r_seskey,
                             void **r_enckey, size_t *r_enckeylen);
 aead_algo_t use_aead (pk_list_t pk_list, int algo);
@@ -400,7 +396,8 @@ gpg_error_t transfer_secret_keys (ctrl_t ctrl, struct import_stats_s *stats,
                                   kbnode_t sec_keyblock, int batch, int force,
                                   int only_marked);
 
-int collapse_uids( KBNODE *keyblock );
+int collapse_uids (kbnode_t *keyblock);
+int collapse_subkeys (kbnode_t *keyblock);
 
 int get_revocation_reason (PKT_signature *sig, char **r_reason,
                            char **r_comment, size_t *r_commentlen);

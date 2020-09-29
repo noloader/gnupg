@@ -62,19 +62,9 @@ do_encode_md (const byte * md, size_t mdlen, int algo, gcry_sexp_t * r_hash,
     }
   else
     {
-      gcry_mpi_t mpi;
-
-      rc = gcry_mpi_scan (&mpi, GCRYMPI_FMT_USG, md, mdlen, NULL);
-      if (!rc)
-	{
-	  rc = gcry_sexp_build (&hash, NULL,
-				"(data (flags raw) (value %m))",
-				mpi);
-	  gcry_mpi_release (mpi);
-	}
-      else
-        hash = NULL;
-
+      rc = gcry_sexp_build (&hash, NULL,
+                            "(data (flags raw) (value %b))",
+                            (int)mdlen, md);
     }
 
   *r_hash = hash;
@@ -139,15 +129,20 @@ rfc6979_hash_algo_string (size_t mdlen)
 /* Encode a message digest for use with the EdDSA algorithm
    (i.e. curve Ed25519). */
 static gpg_error_t
-do_encode_eddsa (const byte *md, size_t mdlen, gcry_sexp_t *r_hash)
+do_encode_eddsa (size_t nbits, const byte *md, size_t mdlen,
+                 gcry_sexp_t *r_hash)
 {
   gpg_error_t err;
   gcry_sexp_t hash;
+  const char *fmt;
+
+  if (nbits == 448)
+    fmt = "(data(value %b))";
+  else
+    fmt = "(data(flags eddsa)(hash-algo sha512)(value %b))";
 
   *r_hash = NULL;
-  err = gcry_sexp_build (&hash, NULL,
-                         "(data(flags eddsa)(hash-algo sha512)(value %b))",
-                         (int)mdlen, md);
+  err = gcry_sexp_build (&hash, NULL, fmt, (int)mdlen, md);
   if (!err)
     *r_hash = hash;
   return err;
@@ -165,7 +160,7 @@ do_encode_dsa (const byte *md, size_t mdlen, int pkalgo, gcry_sexp_t pkey,
 
   *r_hash = NULL;
 
-  if (pkalgo == GCRY_PK_ECDSA)
+  if (pkalgo == GCRY_PK_ECC)
     qbits = gcry_pk_get_nbits (pkey);
   else if (pkalgo == GCRY_PK_DSA)
     qbits = get_dsa_qbits (pkey);
@@ -192,10 +187,10 @@ do_encode_dsa (const byte *md, size_t mdlen, int pkalgo, gcry_sexp_t pkey,
       return gpg_error (GPG_ERR_INV_LENGTH);
     }
 
-  /* ECDSA 521 is special has it is larger than the largest hash
+  /* ECDSA 521 is special as it is larger than the largest hash
      we have (SHA-512).  Thus we change the size for further
      processing to 512.  */
-  if (pkalgo == GCRY_PK_ECDSA && qbits > 512)
+  if (pkalgo == GCRY_PK_ECC && qbits > 512)
     qbits = 512;
 
   /* Check if we're too short.  Too long is safe as we'll
@@ -298,11 +293,17 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
   const unsigned char *data;
   int datalen;
   int check_signature = 0;
+  int algo;
 
   if (overridedata)
     {
       data = overridedata;
       datalen = overridedatalen;
+    }
+  else if (ctrl->digest.data)
+    {
+      data = ctrl->digest.data;
+      datalen = ctrl->digest.valuelen;
     }
   else
     {
@@ -324,6 +325,8 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
       goto leave;
     }
 
+  algo = get_pk_algo_from_key (s_skey);
+
   if (shadow_info || no_shadow_info)
     {
       /* Divert operation to the smartcard.  With NO_SHADOW_INFO set
@@ -331,10 +334,6 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
        * is on the active card.  */
       size_t len;
       unsigned char *buf = NULL;
-      int key_type;
-      int is_RSA = 0;
-      int is_ECDSA = 0;
-      int is_EdDSA = 0;
 
       if (no_shadow_info)
         {
@@ -390,17 +389,6 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
             }
         }
 
-      if (agent_is_eddsa_key (s_pkey))
-        is_EdDSA = 1;
-      else
-        {
-          key_type = agent_is_dsa_key (s_pkey);
-          if (key_type == 0)
-            is_RSA = 1;
-          else if (key_type == GCRY_PK_ECDSA)
-            is_ECDSA = 1;
-        }
-
       {
         char *desc2 = NULL;
 
@@ -420,7 +408,7 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
           goto leave;
         }
 
-      if (is_RSA)
+      if (algo == GCRY_PK_RSA)
         {
           unsigned char *p = buf;
 
@@ -446,12 +434,12 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
           err = gcry_sexp_build (&s_sig, NULL, "(sig-val(rsa(s%b)))",
                                  (int)len, p);
         }
-      else if (is_EdDSA)
+      else if (algo == GCRY_PK_EDDSA)
         {
           err = gcry_sexp_build (&s_sig, NULL, "(sig-val(eddsa(r%b)(s%b)))",
                                  (int)len/2, buf, (int)len/2, buf + len/2);
         }
-      else if (is_ECDSA)
+      else if (algo == GCRY_PK_ECC)
         {
           unsigned char *r_buf, *s_buf;
           int r_buflen, s_buflen;
@@ -496,20 +484,25 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
   else
     {
       /* No smartcard, but a private key (in S_SKEY). */
-      int dsaalgo = 0;
 
       /* Put the hash into a sexp */
-      if (agent_is_eddsa_key (s_skey))
-        err = do_encode_eddsa (data, datalen,
+      if (algo == GCRY_PK_EDDSA)
+        err = do_encode_eddsa (gcry_pk_get_nbits (s_skey), data, datalen,
                                &s_hash);
       else if (ctrl->digest.algo == MD_USER_TLS_MD5SHA1)
         err = do_encode_raw_pkcs1 (data, datalen,
                                    gcry_pk_get_nbits (s_skey),
                                    &s_hash);
-      else if ( (dsaalgo = agent_is_dsa_key (s_skey)) )
+      else if (algo == GCRY_PK_DSA || algo == GCRY_PK_ECC)
         err = do_encode_dsa (data, datalen,
-                             dsaalgo, s_skey,
+                             algo, s_skey,
                              &s_hash);
+      else if (ctrl->digest.is_pss)
+        {
+          log_info ("signing with rsaPSS is currently only supported"
+                    " for (some) smartcards\n");
+          err = gpg_error (GPG_ERR_NOT_SUPPORTED);
+        }
       else
         err = do_encode_md (data, datalen,
                             ctrl->digest.algo,
@@ -518,7 +511,7 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
       if (err)
         goto leave;
 
-      if (dsaalgo == 0 && GCRYPT_VERSION_NUMBER < 0x010700)
+      if (algo == GCRY_PK_RSA && GCRYPT_VERSION_NUMBER < 0x010700)
         {
           /* It's RSA and Libgcrypt < 1.7 */
           check_signature = 1;
@@ -553,7 +546,13 @@ agent_pksign_do (ctrl_t ctrl, const char *cache_nonce,
 
       if (s_hash == NULL)
         {
-          if (ctrl->digest.algo == MD_USER_TLS_MD5SHA1)
+          if (ctrl->digest.is_pss)
+            {
+              err = gcry_sexp_build (&s_hash, NULL,
+                                     "(data (flags raw) (value %b))",
+                                     (int)datalen, data);
+            }
+          else if (ctrl->digest.algo == MD_USER_TLS_MD5SHA1)
             err = do_encode_raw_pkcs1 (data, datalen,
                                        gcry_pk_get_nbits (sexp_key), &s_hash);
           else

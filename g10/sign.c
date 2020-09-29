@@ -204,7 +204,7 @@ mk_notation_policy_etc (ctrl_t ctrl, PKT_signature *sig,
 
 
 /*
- * Put the Key Block subpakcet into SIG for key PKSK.  Returns an
+ * Put the Key Block subpacket into SIG for key PKSK.  Returns an
  * error code on failure.
  */
 static gpg_error_t
@@ -456,7 +456,8 @@ do_sign (ctrl_t ctrl, PKT_public_key *pksk, PKT_signature *sig,
       goto leave;
     }
 
-  if (! gnupg_pk_is_allowed (opt.compliance, PK_USE_SIGNING, pksk->pubkey_algo,
+  if (! gnupg_pk_is_allowed (opt.compliance, PK_USE_SIGNING,
+                             pksk->pubkey_algo, 0,
                              pksk->pkey, nbits_from_pk (pksk), NULL))
     {
       log_error (_("key %s may not be used for signing in %s mode\n"),
@@ -505,10 +506,12 @@ do_sign (ctrl_t ctrl, PKT_public_key *pksk, PKT_signature *sig,
       else if (pksk->pubkey_algo == GCRY_PK_RSA
                || pksk->pubkey_algo == GCRY_PK_RSA_S)
         sig->data[0] = get_mpi_from_sexp (s_sigval, "s", GCRYMPI_FMT_USG);
-      else if (openpgp_oid_is_ed25519 (pksk->pkey[0]))
+      else if (pksk->pubkey_algo == PUBKEY_ALGO_ECDSA
+               || pksk->pubkey_algo == PUBKEY_ALGO_EDDSA)
         {
-          sig->data[0] = get_mpi_from_sexp (s_sigval, "r", GCRYMPI_FMT_OPAQUE);
-          sig->data[1] = get_mpi_from_sexp (s_sigval, "s", GCRYMPI_FMT_OPAQUE);
+          err = sexp_extract_param_sos (s_sigval, "r", &sig->data[0]);
+          if (!err)
+            err = sexp_extract_param_sos (s_sigval, "s", &sig->data[1]);
         }
       else
         {
@@ -594,7 +597,7 @@ openpgp_card_v1_p (PKT_public_key *pk)
 }
 
 
-
+/* Get a matching hash algorithm for DSA and ECDSA.  */
 static int
 match_dsa_hash (unsigned int qbytes)
 {
@@ -628,7 +631,7 @@ match_dsa_hash (unsigned int qbytes)
   usable for the pubkey algorithm.  If --personal-digest-prefs isn't
   set, then take the OpenPGP default (i.e. SHA-1).
 
-  Note that Ed25519+EdDSA takes an input of arbitrary length and thus
+  Note that EdDSA takes an input of arbitrary length and thus
   we don't enforce any particular algorithm like we do for standard
   ECDSA. However, we use SHA256 as the default algorithm.
 
@@ -647,13 +650,15 @@ hash_for (PKT_public_key *pk)
     {
       return recipient_digest_algo;
     }
-  else if (pk->pubkey_algo == PUBKEY_ALGO_EDDSA
-           && openpgp_oid_is_ed25519 (pk->pkey[0]))
+  else if (pk->pubkey_algo == PUBKEY_ALGO_EDDSA)
     {
       if (opt.personal_digest_prefs)
         return opt.personal_digest_prefs[0].value;
       else
-        return DIGEST_ALGO_SHA256;
+        if (gcry_mpi_get_nbits (pk->pkey[1]) > 256)
+          return DIGEST_ALGO_SHA512;
+        else
+          return DIGEST_ALGO_SHA256;
     }
   else if (pk->pubkey_algo == PUBKEY_ALGO_DSA
            || pk->pubkey_algo == PUBKEY_ALGO_ECDSA)
@@ -669,9 +674,13 @@ hash_for (PKT_public_key *pk)
 	 160-bit hash unless --enable-dsa2 is set, in which case act
 	 like a new DSA key that just happens to have a 160-bit q
 	 (i.e. allow truncation).  If q is not 160, by definition it
-	 must be a new DSA key. */
+	 must be a new DSA key.  We ignore the personal_digest_prefs
+	 for ECDSA because they should always macth the curve and
+	 truncated hashes are not useful either.  Even worse,
+	 smartcards may reject non matching hash lengths for curves
+	 (e.g. using SHA-512 with brainpooolP385r1 on a Yubikey).  */
 
-      if (opt.personal_digest_prefs)
+      if (pk->pubkey_algo == PUBKEY_ALGO_DSA && opt.personal_digest_prefs)
 	{
 	  prefitem_t *prefs;
 
@@ -1740,14 +1749,15 @@ make_keysig_packet (ctrl_t ctrl,
     digest_algo = opt.cert_digest_algo;
   else if (pksk->pubkey_algo == PUBKEY_ALGO_DSA) /* Meet DSA requirements.  */
     digest_algo = match_dsa_hash (gcry_mpi_get_nbits (pksk->pkey[1])/8);
-  else if (pksk->pubkey_algo == PUBKEY_ALGO_ECDSA /* Meet ECDSA requirements. */
-           || pksk->pubkey_algo == PUBKEY_ALGO_EDDSA)
+  else if (pksk->pubkey_algo == PUBKEY_ALGO_ECDSA) /* Meet ECDSA requirements. */
+    digest_algo = match_dsa_hash
+      (ecdsa_qbits_from_Q (gcry_mpi_get_nbits (pksk->pkey[1]))/8);
+  else if (pksk->pubkey_algo == PUBKEY_ALGO_EDDSA)
     {
-      if (openpgp_oid_is_ed25519 (pksk->pkey[0]))
-        digest_algo = DIGEST_ALGO_SHA256;
+      if (gcry_mpi_get_nbits (pksk->pkey[1]) > 256)
+        digest_algo = DIGEST_ALGO_SHA512;
       else
-        digest_algo = match_dsa_hash
-          (ecdsa_qbits_from_Q (gcry_mpi_get_nbits (pksk->pkey[1]))/8);
+        digest_algo = DIGEST_ALGO_SHA256;
     }
   else /* Use the default.  */
     digest_algo = DEFAULT_DIGEST_ALGO;

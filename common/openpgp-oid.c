@@ -48,6 +48,8 @@ static struct {
 
   { "Curve25519", "1.3.6.1.4.1.3029.1.5.1", 255, "cv25519", PUBKEY_ALGO_ECDH },
   { "Ed25519",    "1.3.6.1.4.1.11591.15.1", 255, "ed25519", PUBKEY_ALGO_EDDSA },
+  { "X448",       "1.3.101.111",            448, "cv448",   PUBKEY_ALGO_ECDH },
+  { "Ed448",      "1.3.101.113",            448, "ed448",   PUBKEY_ALGO_EDDSA },
 
   { "NIST P-256",      "1.2.840.10045.3.1.7",    256, "nistp256" },
   { "NIST P-384",      "1.3.132.0.34",           384, "nistp384" },
@@ -70,6 +72,16 @@ static const char oid_ed25519[] =
 /* The OID for Curve25519 in OpenPGP format.  */
 static const char oid_cv25519[] =
   { 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01 };
+
+/* The OID for X448 in OpenPGP format. */
+/*
+ * Here, we have a little semantic discrepancy.  X448 is the name of
+ * the ECDH computation and the OID is assigned to the algorithm in
+ * RFC 8410.  Note that this OID is not the one which is assigned to
+ * the curve itself (originally in 8410).  Nevertheless, we use "X448"
+ * for the curve in libgcrypt.
+ */
+static const char oid_cv448[] = { 0x03, 0x2b, 0x65, 0x6f };
 
 /* A table to store keyalgo strings like "rsa2048 or "ed25519" so that
  * we do not need to allocate them.  This is currently a simple array
@@ -334,6 +346,15 @@ openpgp_oidbuf_is_cv25519 (const void *buf, size_t len)
 }
 
 
+/* Return true if (BUF,LEN) represents the OID for X448.  */
+static int
+openpgp_oidbuf_is_cv448 (const void *buf, size_t len)
+{
+  return (buf && len == DIM (oid_cv448)
+          && !memcmp (buf, oid_cv448, DIM (oid_cv448)));
+}
+
+
 /* Return true if the MPI A represents the OID for Curve25519.  */
 int
 openpgp_oid_is_cv25519 (gcry_mpi_t a)
@@ -346,6 +367,21 @@ openpgp_oid_is_cv25519 (gcry_mpi_t a)
 
   buf = gcry_mpi_get_opaque (a, &nbits);
   return openpgp_oidbuf_is_cv25519 (buf, (nbits+7)/8);
+}
+
+
+/* Return true if the MPI A represents the OID for X448.  */
+int
+openpgp_oid_is_cv448 (gcry_mpi_t a)
+{
+  const unsigned char *buf;
+  unsigned int nbits;
+
+  if (!a || !gcry_mpi_get_flag (a, GCRYMPI_FLAG_OPAQUE))
+    return 0;
+
+  buf = gcry_mpi_get_opaque (a, &nbits);
+  return openpgp_oidbuf_is_cv448 (buf, (nbits+7)/8);
 }
 
 
@@ -532,7 +568,7 @@ map_openpgp_pk_to_gcry (pubkey_algo_t algo)
     case PUBKEY_ALGO_EDDSA:  return GCRY_PK_EDDSA;
     case PUBKEY_ALGO_ECDSA:  return GCRY_PK_ECDSA;
     case PUBKEY_ALGO_ECDH:   return GCRY_PK_ECDH;
-    default: return algo < 110 ? algo : 0;
+    default: return algo < 110 ? (enum gcry_pk_algos)algo : 0;
     }
 }
 
@@ -540,9 +576,9 @@ map_openpgp_pk_to_gcry (pubkey_algo_t algo)
 /* Return a string describing the public key algorithm and the
  * keysize.  For elliptic curves the function prints the name of the
  * curve because the keysize is a property of the curve.  ALGO is the
- * Gcrypt algorithmj number, curve is either NULL or give the PID of
- * the curve, NBITS is either 0 or the size of the algorithms for RSA
- * etc.  The returned string is taken from permanent table.  Examples
+ * Gcrypt algorithm number, CURVE is either NULL or gives the OID of
+ * the curve, NBITS is either 0 or the size for algorithms like RSA.
+ * The returned string is taken from permanent table.  Examples
  * for the output are:
  *
  * "rsa3072"    - RSA with 3072 bit

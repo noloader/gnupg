@@ -42,6 +42,7 @@
 #include "trustdb.h"
 #include "call-agent.h"
 #include "key-clean.h"
+#include "pkglue.h"
 
 
 /* An object to keep track of subkeys. */
@@ -567,6 +568,8 @@ match_curve_skey_pk (gcry_sexp_t s_key, PKT_public_key *pk)
       log_error ("no curve name\n");
       return gpg_error (GPG_ERR_UNKNOWN_CURVE);
     }
+  if (!strcmp (curve_str, "Ed448"))
+    is_eddsa = 1;
   oidstr = openpgp_curve_to_oid (curve_str, NULL, NULL);
   if (!oidstr)
     {
@@ -750,10 +753,8 @@ cleartext_secret_key_to_openpgp (gcry_sexp_t s_key, PKT_public_key *pk)
       err = match_curve_skey_pk (key, pk);
       if (err)
         goto leave;
-      if (!err)
-        err = gcry_sexp_extract_param (key, NULL, "q",
-                                       &pub_params[0],
-                                       NULL);
+      else
+        err = sexp_extract_param_sos (key, "q", &pub_params[0]);
       if (!err && (gcry_mpi_cmp(pk->pkey[1], pub_params[0])))
         err = gpg_error (GPG_ERR_BAD_PUBKEY);
 
@@ -764,9 +765,7 @@ cleartext_secret_key_to_openpgp (gcry_sexp_t s_key, PKT_public_key *pk)
         {
           gcry_mpi_release (pk->pkey[sec_start]);
           pk->pkey[sec_start] = NULL;
-          err = gcry_sexp_extract_param (key, NULL, "d",
-                                         &pk->pkey[sec_start],
-                                         NULL);
+          err = sexp_extract_param_sos (key, "d", &pk->pkey[sec_start]);
         }
 
       if (!err)
@@ -978,15 +977,16 @@ transfer_format_to_openpgp (gcry_sexp_t s_pgp, PKT_public_key *pk)
       value = gcry_sexp_nth_data (list, ++idx, &valuelen);
       if (!value || !valuelen)
         goto bad_seckey;
-      if (is_enc)
+      if (is_enc
+          || pk->pubkey_algo == PUBKEY_ALGO_ECDSA
+          || pk->pubkey_algo == PUBKEY_ALGO_EDDSA
+          || pk->pubkey_algo == PUBKEY_ALGO_ECDH)
         {
-          void *p = xtrymalloc (valuelen);
-          if (!p)
-            goto outofmem;
-          memcpy (p, value, valuelen);
-          skey[skeyidx] = gcry_mpi_set_opaque (NULL, p, valuelen*8);
+          skey[skeyidx] = gcry_mpi_set_opaque_copy (NULL, value, valuelen*8);
           if (!skey[skeyidx])
             goto outofmem;
+          if (is_enc)
+            gcry_mpi_set_flag (skey[skeyidx], GCRYMPI_FLAG_USER1);
         }
       else
         {
@@ -1144,7 +1144,7 @@ transfer_format_to_openpgp (gcry_sexp_t s_pgp, PKT_public_key *pk)
   /* Check that the first secret key parameter in SKEY is encrypted
      and that there are no more secret key parameters.  The latter is
      guaranteed by the v4 packet format.  */
-  if (!gcry_mpi_get_flag (skey[npkey], GCRYMPI_FLAG_OPAQUE))
+  if (!gcry_mpi_get_flag (skey[npkey], GCRYMPI_FLAG_USER1))
     goto bad_seckey;
   if (npkey+1 < DIM (skey) && skey[npkey+1])
     goto bad_seckey;
@@ -2482,7 +2482,7 @@ export_ssh_key (ctrl_t ctrl, const char *userid)
     err = gpg_error_from_syserror ();
   else
     {
-      if (es_fclose (fp))
+      if (fp != es_stdout && es_fclose (fp))
         err = gpg_error_from_syserror ();
       fp = NULL;
     }
@@ -2491,7 +2491,8 @@ export_ssh_key (ctrl_t ctrl, const char *userid)
     log_error (_("error writing '%s': %s\n"), fname, gpg_strerror (err));
 
  leave:
-  es_fclose (fp);
+  if (fp != es_stdout)
+    es_fclose (fp);
   release_kbnode (keyblock);
   return err;
 }

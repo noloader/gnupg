@@ -75,10 +75,12 @@ enum cmd_and_opt_values
     oCMS,
     oSetFilename,
     oNull,
+    oUtf8Strings,
 
     /* Compatibility with gpg-zip.  */
     oGpgArgs,
     oTarArgs,
+    oTarProgram,
 
     /* Debugging.  */
     oDryRun,
@@ -119,9 +121,16 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_s (oFilesFrom, "files-from",
                 N_("|FILE|get names to create from FILE")),
   ARGPARSE_s_n (oNull, "null", N_("-T reads null-terminated names")),
+#ifdef HAVE_W32_SYSTEM
+  ARGPARSE_s_n (oUtf8Strings, "utf8-strings",
+                N_("-T reads UTF-8 encoded names")),
+#else
+  ARGPARSE_s_n (oUtf8Strings, "utf8-strings", "@"),
+#endif
 
   ARGPARSE_s_s (oGpgArgs, "gpg-args", "@"),
   ARGPARSE_s_s (oTarArgs, "tar-args", "@"),
+  ARGPARSE_s_s (oTarProgram, "tar", "@"),
 
   ARGPARSE_end ()
 };
@@ -140,10 +149,10 @@ static gpgrt_opt_t tar_opts[] = {
 
 
 /* Global flags.  */
-enum cmd_and_opt_values cmd = 0;
-int skip_crypto = 0;
-const char *files_from = NULL;
-int null_names = 0;
+static enum cmd_and_opt_values cmd = 0;
+static int skip_crypto = 0;
+static const char *files_from = NULL;
+static int null_names = 0;
 
 
 
@@ -323,6 +332,7 @@ parse_arguments (gpgrt_argparse_t *pargs, gpgrt_opt_t *popts)
         case oNoVerbose: opt.verbose = 0; break;
         case oFilesFrom: files_from = pargs->r.ret_str; break;
         case oNull: null_names = 1; break;
+        case oUtf8Strings: opt.utf8strings = 1; break;
 
 	case aList:
         case aDecrypt:
@@ -381,6 +391,9 @@ parse_arguments (gpgrt_argparse_t *pargs, gpgrt_opt_t *popts)
           }
           break;
 
+        case oTarProgram:  /* Dummy option.  */
+          break;
+
         case oTarArgs:
           {
             int tar_argc;
@@ -414,6 +427,7 @@ parse_arguments (gpgrt_argparse_t *pargs, gpgrt_opt_t *popts)
     }
 }
 
+
 
 /* gpgtar main. */
 int
@@ -439,11 +453,6 @@ main (int argc, char **argv)
   pargs.flags = ARGPARSE_FLAG_KEEP;
   parse_arguments (&pargs, opts);
   gpgrt_argparse (NULL, &pargs, NULL);
-
-  if ((files_from && !null_names) || (!files_from && null_names))
-    log_error ("--files-from and --null may only be used in conjunction\n");
-  if (files_from && strcmp (files_from, "-"))
-    log_error ("--files-from only supports argument \"-\"\n");
 
   if (log_get_errorcount (0))
     exit (2);
@@ -482,12 +491,14 @@ main (int argc, char **argv)
     case aEncrypt:
     case aSign:
     case aSignEncrypt:
-      if ((!argc && !null_names)
-          || (argc && null_names))
+      if ((!argc && !files_from)
+          || (argc && files_from))
         gpgrt_usage (1);
       if (opt.filename)
         log_info ("note: ignoring option --set-filename\n");
-      err = gpgtar_create (null_names? NULL :argv,
+      err = gpgtar_create (files_from? NULL : argv,
+                           files_from,
+                           null_names,
                            !skip_crypto
                            && (cmd == aEncrypt || cmd == aSignEncrypt),
                            cmd == aSign || cmd == aSignEncrypt);

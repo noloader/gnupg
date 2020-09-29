@@ -372,7 +372,7 @@ read_and_protect (const char *fname)
 static void
 read_and_unprotect (ctrl_t ctrl, const char *fname)
 {
-  int  rc;
+  gpg_error_t err;
   unsigned char *key;
   unsigned char *result;
   size_t resultlen;
@@ -383,15 +383,15 @@ read_and_unprotect (ctrl_t ctrl, const char *fname)
   if (!key)
     return;
 
-  rc = agent_unprotect (ctrl, key, (pw=get_passphrase (1)),
-                        protected_at, &result, &resultlen);
+  err = agent_unprotect (ctrl, key, (pw=get_passphrase (1)),
+                         protected_at, &result, &resultlen);
   release_passphrase (pw);
   xfree (key);
-  if (rc)
+  if (err)
     {
       if (opt_status_msg)
         log_info ("[PROTECT-TOOL:] bad-passphrase\n");
-      log_error ("unprotecting the key failed: %s\n", gpg_strerror (rc));
+      log_error ("unprotecting the key failed: %s\n", gpg_strerror (err));
       return;
     }
   if (opt.verbose)
@@ -404,6 +404,12 @@ read_and_unprotect (ctrl_t ctrl, const char *fname)
         log_info ("key protection done at [unknown]\n");
     }
 
+  err = fixup_when_ecc_private_key (result, &resultlen);
+  if (err)
+    {
+      log_error ("malformed key: %s\n", gpg_strerror (err));
+      return;
+    }
   if (opt_armor)
     {
       char *p = make_advanced (result, resultlen);
@@ -810,7 +816,8 @@ agent_askpin (ctrl_t ctrl,
 int
 agent_write_private_key (const unsigned char *grip,
                          const void *buffer, size_t length, int force,
-                         const char *serialno, const char *keyref)
+                         const char *serialno, const char *keyref,
+                         time_t timestamp)
 {
   char hexgrip[40+4+1];
   char *p;
@@ -818,6 +825,7 @@ agent_write_private_key (const unsigned char *grip,
   (void)force;
   (void)serialno;
   (void)keyref;
+  (void)timestamp;
 
   bin2hex (grip, 20, hexgrip);
   strcpy (hexgrip+40, ".key");

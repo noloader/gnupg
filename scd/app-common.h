@@ -53,7 +53,9 @@
 typedef enum
   {
    CARDTYPE_GENERIC = 0,
-   CARDTYPE_YUBIKEY
+   CARDTYPE_GNUK,
+   CARDTYPE_YUBIKEY,
+   CARDTYPE_ZEITCONTROL
 
   } cardtype_t;
 
@@ -217,9 +219,10 @@ app_get_slot (app_t app)
 unsigned int app_help_count_bits (const unsigned char *a, size_t len);
 gpg_error_t app_help_get_keygrip_string_pk (const void *pk, size_t pklen,
                                             char *hexkeygrip,
-                                            gcry_sexp_t *r_pkey);
+                                            gcry_sexp_t *r_pkey,
+                                            int *r_algo, char **r_algostr);
 gpg_error_t app_help_get_keygrip_string (ksba_cert_t cert, char *hexkeygrip,
-                                         gcry_sexp_t *r_pkey);
+                                         gcry_sexp_t *r_pkey, int *r_algo);
 gpg_error_t app_help_pubkey_from_cert (const void *cert, size_t certlen,
                                        unsigned char **r_pk, size_t *r_pklen);
 size_t app_help_read_length_of_cert (int slot, int fid, size_t *r_certoff);

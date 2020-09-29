@@ -29,6 +29,7 @@
 #define map_assuan_err(a) \
         map_assuan_err_with_source (GPG_ERR_SOURCE_DEFAULT, (a))
 #include <errno.h>
+#include <assuan.h>
 
 #include <gcrypt.h>
 #include "../common/util.h"
@@ -53,6 +54,13 @@
    this shouldn't be a problem in practice.  */
 #define MAX_PASSPHRASE_LEN 255
 
+/* The daemons we support.  When you add a new daemon, add to
+   both the daemon_type and the daemon_modules array in call-daemon.c */
+enum daemon_type
+  {
+   DAEMON_SCD,
+   DAEMON_MAX_TYPE
+  };
 
 /* A large struct name "opt" to keep global flags */
 EXTERN_UNLESS_MAIN_MODULE
@@ -79,10 +87,10 @@ struct
   /* Filename of the program to start as pinentry.  */
   const char *pinentry_program;
 
-  /* Filename of the program to handle smartcard tasks.  */
-  const char *scdaemon_program;
+  /* Filename of the program to handle daemon tasks.  */
+  const char *daemon_program[DAEMON_MAX_TYPE];
 
-  int disable_scdaemon;         /* Never use the SCdaemon. */
+  int disable_daemon[DAEMON_MAX_TYPE];         /* Never use the daemon. */
 
   int no_grab;         /* Don't let the pinentry grab the keyboard */
 
@@ -207,7 +215,7 @@ struct ssh_control_file_s;
 typedef struct ssh_control_file_s *ssh_control_file_t;
 
 /* Forward reference for local definitions in call-scd.c.  */
-struct scd_local_s;
+struct daemon_local_s;
 
 /* Collection of data per session (aka connection). */
 struct server_control_s
@@ -227,8 +235,8 @@ struct server_control_s
   /* Private data of the server (command.c). */
   struct server_local_s *server_local;
 
-  /* Private data of the SCdaemon (call-scd.c). */
-  struct scd_local_s *scd_local;
+  /* Private data of the daemon (call-XXX.c). */
+  struct daemon_local_s *d_local[DAEMON_MAX_TYPE];
 
   /* Environment settings for the connection.  */
   session_env_t session_env;
@@ -245,10 +253,15 @@ struct server_control_s
 
   /* Information on the currently used digest (for signing commands).  */
   struct {
+    char *data;    /* NULL or malloced data of length VALUELEN.  If
+                      this is set the other fields are ignored.  Used
+                      for PureEdDSA and RSA with PSS (in which case
+                      data_is_pss is also set).  */
+    int valuelen;
     int algo;
     unsigned char value[MAX_DIGEST_LEN];
-    int valuelen;
-    int raw_value: 1;
+    unsigned int raw_value: 1;
+    unsigned int is_pss: 1;    /* DATA holds PSS formated data.  */
   } digest;
   unsigned char keygrip[20];
   int have_keygrip;
@@ -383,7 +396,7 @@ const char *get_agent_socket_name (void);
 const char *get_agent_ssh_socket_name (void);
 int get_agent_active_connection_count (void);
 #ifdef HAVE_W32_SYSTEM
-void *get_agent_scd_notify_event (void);
+void *get_agent_daemon_notify_event (void);
 #endif
 void agent_sighup_action (void);
 int map_pk_openpgp_to_gcry (int openpgp_algo);
@@ -429,7 +442,8 @@ gpg_error_t agent_modify_description (const char *in, const char *comment,
                                       const gcry_sexp_t key, char **result);
 int agent_write_private_key (const unsigned char *grip,
                              const void *buffer, size_t length, int force,
-                             const char *serialno, const char *keyref);
+                             const char *serialno, const char *keyref,
+                             time_t timestamp);
 gpg_error_t agent_key_from_file (ctrl_t ctrl,
                                  const char *cache_nonce,
                                  const char *desc_text,
@@ -444,12 +458,12 @@ gpg_error_t agent_raw_key_from_file (ctrl_t ctrl, const unsigned char *grip,
 gpg_error_t agent_public_key_from_file (ctrl_t ctrl,
                                         const unsigned char *grip,
                                         gcry_sexp_t *result);
-int agent_is_dsa_key (gcry_sexp_t s_key);
-int agent_is_eddsa_key (gcry_sexp_t s_key);
+int agent_pk_get_algo (gcry_sexp_t s_key);
 int agent_key_available (const unsigned char *grip);
 gpg_error_t agent_key_info_from_file (ctrl_t ctrl, const unsigned char *grip,
                                       int *r_keytype,
-                                      unsigned char **r_shadow_info);
+                                      unsigned char **r_shadow_info,
+                                      unsigned char **r_shadow_info_type);
 gpg_error_t agent_delete_key (ctrl_t ctrl, const char *desc_text,
                               const unsigned char *grip,
                               int force, int only_stubs);
@@ -467,7 +481,8 @@ gpg_error_t agent_askpin (ctrl_t ctrl,
 int agent_get_passphrase (ctrl_t ctrl, char **retpass,
                           const char *desc, const char *prompt,
                           const char *errtext, int with_qualitybar,
-			  const char *keyinfo, cache_mode_t cache_mode);
+			  const char *keyinfo, cache_mode_t cache_mode,
+                          struct pin_entry_info_s *pininfo);
 int agent_get_confirmation (ctrl_t ctrl, const char *desc, const char *ok,
 			    const char *notokay, int with_cancel);
 int agent_show_message (ctrl_t ctrl, const char *desc, const char *ok_btn);
@@ -504,11 +519,11 @@ int agent_pkdecrypt (ctrl_t ctrl, const char *desc_text,
                      membuf_t *outbuf, int *r_padding);
 
 /*-- genkey.c --*/
-int check_passphrase_constraints (ctrl_t ctrl, const char *pw,
+int check_passphrase_constraints (ctrl_t ctrl, const char *pw, int no_empty,
 				  char **failed_constraint);
 gpg_error_t agent_ask_new_passphrase (ctrl_t ctrl, const char *prompt,
                                       char **r_passphrase);
-int agent_genkey (ctrl_t ctrl, const char *cache_nonce,
+int agent_genkey (ctrl_t ctrl, const char *cache_nonce, time_t timestamp,
                   const char *keyparam, size_t keyparmlen,
                   int no_protection, const char *override_passphrase,
                   int preset, membuf_t *outbuf);
@@ -533,8 +548,15 @@ unsigned char *make_shadow_info (const char *serialno, const char *idstring);
 int agent_shadow_key (const unsigned char *pubkey,
                       const unsigned char *shadow_info,
                       unsigned char **result);
+int agent_shadow_key_type (const unsigned char *pubkey,
+                           const unsigned char *shadow_info,
+                           const unsigned char *type,
+                           unsigned char **result);
 gpg_error_t agent_get_shadow_info (const unsigned char *shadowkey,
                                    unsigned char const **shadow_info);
+gpg_error_t agent_get_shadow_info_type (const unsigned char *shadowkey,
+                                        unsigned char const **shadow_info,
+                                        unsigned char **shadow_type);
 gpg_error_t parse_shadow_info (const unsigned char *shadow_info,
                                char **r_hexsn, char **r_idstr, int *r_pinlen);
 gpg_error_t s2k_hash_passphrase (const char *passphrase, int hashalgo,
@@ -573,12 +595,18 @@ gpg_error_t divert_writekey (ctrl_t ctrl, int force, const char *serialno,
                              const char *keyref,
                              const char *keydata, size_t keydatalen);
 
+/*-- call-daemon.c --*/
+gpg_error_t daemon_start (enum daemon_type type, ctrl_t ctrl);
+assuan_context_t daemon_type_ctx (enum daemon_type type, ctrl_t ctrl);
+gpg_error_t daemon_unlock (enum daemon_type type, ctrl_t ctrl, gpg_error_t rc);
+void initialize_module_daemon (void);
+void agent_daemon_dump_state (void);
+int agent_daemon_check_running (enum daemon_type type);
+void agent_daemon_check_aliveness (void);
+void agent_reset_daemon (ctrl_t ctrl);
+void agent_kill_daemon (enum daemon_type type);
 
 /*-- call-scd.c --*/
-void initialize_module_call_scd (void);
-void agent_scd_dump_state (void);
-int agent_scd_check_running (void);
-int agent_reset_scd (ctrl_t ctrl);
 int agent_card_learn (ctrl_t ctrl,
                       void (*kpinfo_cb)(void*, const char *),
                       void *kpinfo_cb_arg,
@@ -621,10 +649,10 @@ int agent_card_scd (ctrl_t ctrl, const char *cmdline,
                     int (*getpin_cb)(void *, const char *,
                                      const char *, char*, size_t),
                     void *getpin_cb_arg, void *assuan_context);
+
 void agent_card_free_keyinfo (struct card_key_info_s *l);
 gpg_error_t agent_card_keyinfo (ctrl_t ctrl, const char *keygrip,
                                 int cap, struct card_key_info_s **result);
-void agent_card_killscd (void);
 
 
 /*-- learncard.c --*/
@@ -638,5 +666,10 @@ extract_private_key (gcry_sexp_t s_key, int req_private_key_data,
                      const char **r_format,
                      gcry_mpi_t *mpi_array, int arraysize,
                      gcry_sexp_t *r_curve, gcry_sexp_t *r_flags);
+
+/*-- sexp-secret.c --*/
+gpg_error_t fixup_when_ecc_private_key (unsigned char *buf, size_t *buflen_p);
+gpg_error_t sexp_sscan_private_key (gcry_sexp_t *result, size_t *r_erroff,
+                                    unsigned char *buf);
 
 #endif /*AGENT_H*/

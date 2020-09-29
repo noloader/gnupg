@@ -213,6 +213,36 @@ trim_spaces( char *str )
     return str ;
 }
 
+
+/* Same as trim_spaces but only condider, space, tab, cr and lf as space.  */
+char *
+ascii_trim_spaces (char *str)
+{
+  char *string, *p, *mark;
+
+  string = str;
+
+  /* Find first non-ascii space character.  */
+  for (p=string; *p && ascii_isspace (*p); p++)
+    ;
+  /* Move characters.  */
+  for (mark=NULL; (*string = *p); string++, p++ )
+    {
+      if (ascii_isspace (*p))
+        {
+          if (!mark)
+            mark = string;
+        }
+      else
+        mark = NULL ;
+    }
+  if (mark)
+    *mark = '\0' ;  /* Remove trailing spaces. */
+
+  return str ;
+}
+
+
 /****************
  * remove trailing white spaces
  */
@@ -759,6 +789,12 @@ w32_strerror (int ec)
   FormatMessage (FORMAT_MESSAGE_FROM_SYSTEM, NULL, ec,
                  MAKELANGID (LANG_NEUTRAL, SUBLANG_DEFAULT),
                  strerr, DIM (strerr)-1, NULL);
+  {
+    /* Strip the CR,LF - we want just the string.  */
+    size_t n = strlen (strerr);
+    if (n > 2 && strerr[n-2] == '\r' && strerr[n-1] == '\n' )
+      strerr[n-2] = 0;
+  }
 #endif
   return strerr;
 }
@@ -1327,10 +1363,11 @@ strtokenize (const char *string, const char *delim)
  *   foo (fields[1]);
  */
 int
-split_fields (char *string, char **array, int arraysize)
+split_fields (char *string, const char **array, int arraysize)
 {
   int n = 0;
-  char *p, *pend;
+  const char *p;
+  char *pend;
 
   for (p = string; *p == ' '; p++)
     ;
@@ -1365,10 +1402,11 @@ split_fields (char *string, char **array, int arraysize)
  *   foo (fields[1]);
  */
 int
-split_fields_colon (char *string, char **array, int arraysize)
+split_fields_colon (char *string, const char **array, int arraysize)
 {
   int n = 0;
-  char *p, *pend;
+  const char *p;
+  char *pend;
 
   p = string;
   do

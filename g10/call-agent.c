@@ -220,41 +220,9 @@ default_inq_cb (void *opaque, const char *line)
 static gpg_error_t
 warn_version_mismatch (assuan_context_t ctx, const char *servername, int mode)
 {
-  gpg_error_t err;
-  char *serverversion;
-  const char *myversion = gpgrt_strusage (13);
-
-  err = get_assuan_server_version (ctx, mode, &serverversion);
-  if (err)
-    log_log (gpg_err_code (err) == GPG_ERR_NOT_SUPPORTED?
-             GPGRT_LOGLVL_INFO : GPGRT_LOGLVL_ERROR,
-             _("error getting version from '%s': %s\n"),
-             servername, gpg_strerror (err));
-  else if (compare_version_strings (serverversion, myversion) < 0)
-    {
-      char *warn;
-
-      warn = xtryasprintf (_("server '%s' is older than us (%s < %s)"),
-                           servername, serverversion, myversion);
-      if (!warn)
-        err = gpg_error_from_syserror ();
-      else
-        {
-          log_info (_("WARNING: %s\n"), warn);
-          if (!opt.quiet)
-            {
-              log_info (_("Note: Outdated servers may lack important"
-                          " security fixes.\n"));
-              log_info (_("Note: Use the command \"%s\" to restart them.\n"),
-                        "gpgconf --kill all");
-            }
-          write_status_strings (STATUS_WARNING, "server_version_mismatch 0",
-                                " ", warn, NULL);
-          xfree (warn);
-        }
-    }
-  xfree (serverversion);
-  return err;
+  return warn_server_version_mismatch (ctx, servername, mode,
+                                       write_status_strings2, NULL,
+                                       !opt.quiet);
 }
 
 
@@ -531,6 +499,11 @@ agent_release_card_info (struct agent_card_info_s *info)
       xfree (info->private_do[i]);
       info->private_do[i] = NULL;
     }
+  for (i=0; i < DIM(info->supported_keyalgo); i++)
+    {
+      free_strlist (info->supported_keyalgo[i]);
+      info->supported_keyalgo[i] = NULL;
+    }
 }
 
 
@@ -776,6 +749,25 @@ learn_status_cb (void *opaque, const char *line)
       parm->uif[no] = (data[0] != 0xff);
       xfree (data);
     }
+  else if (keywordlen == 13 && !memcmp (keyword, "KEY-ATTR-INFO", 13))
+    {
+      if (!strncmp (line, "OPENPGP.", 8))
+        {
+          int no;
+
+          line += 8;
+          no = atoi (line);
+          if (no >= 1 && no <= 3)
+            {
+              no--;
+              line++;
+              while (spacep (line))
+                line++;
+              append_to_strlist (&parm->supported_keyalgo[no], xstrdup (line));
+            }
+        }
+        /* Skip when it's not "OPENPGP.[123]".  */
+    }
 
   return 0;
 }
@@ -850,7 +842,7 @@ scd_keypairinfo_status_cb (void *opaque, const char *line)
       /* The format of such a line is:
        *   KEYPAIRINFO <hexgrip> <keyref> [usage] [keytime]
        */
-      char *fields[4];
+      const char *fields[4];
       int nfields;
       const char *hexgrp, *keyref, *usage;
       time_t atime;
@@ -1475,7 +1467,7 @@ readkey_status_cb (void *opaque, const char *line)
        * Note that we use only the first valid KEYPAIRINFO line.  More
        * lines are possible if a second card carries the same key.
        */
-      char *fields[4];
+      const char *fields[4];
       int nfields;
       time_t atime;
 
@@ -1879,13 +1871,15 @@ agent_scd_checkpin  (const char *serialno)
 
 /* Note: All strings shall be UTF-8. On success the caller needs to
    free the string stored at R_PASSPHRASE. On error NULL will be
-   stored at R_PASSPHRASE and an appropriate fpf error code
-   returned. */
+   stored at R_PASSPHRASE and an appropriate error code returned.
+   Only called from passphrase.c:passphrase_get - see there for more
+   comments on this ugly API. */
 gpg_error_t
 agent_get_passphrase (const char *cache_id,
                       const char *err_msg,
                       const char *prompt,
                       const char *desc_msg,
+                      int newsymkey,
                       int repeat,
                       int check,
                       char **r_passphrase)
@@ -1898,6 +1892,7 @@ agent_get_passphrase (const char *cache_id,
   char *arg4 = NULL;
   membuf_t data;
   struct default_inq_parm_s dfltparm;
+  int have_newsymkey;
 
   memset (&dfltparm, 0, sizeof dfltparm);
 
@@ -1913,6 +1908,10 @@ agent_get_passphrase (const char *cache_id,
                        "GETINFO cmd_has_option GET_PASSPHRASE repeat",
                        NULL, NULL, NULL, NULL, NULL, NULL))
     return gpg_error (GPG_ERR_NOT_SUPPORTED);
+  have_newsymkey = !(assuan_transact
+                     (agent_ctx,
+                      "GETINFO cmd_has_option GET_PASSPHRASE newsymkey",
+                      NULL, NULL, NULL, NULL, NULL, NULL));
 
   if (cache_id && *cache_id)
     if (!(arg1 = percent_plus_escape (cache_id)))
@@ -1927,10 +1926,14 @@ agent_get_passphrase (const char *cache_id,
     if (!(arg4 = percent_plus_escape (desc_msg)))
       goto no_mem;
 
+  /* CHECK && REPEAT or NEWSYMKEY is here an indication that a new
+   * passphrase for symmetric encryption is requested; if the agent
+   * supports this we enable the modern API by also passing --newsymkey.  */
   snprintf (line, DIM(line),
-            "GET_PASSPHRASE --data --repeat=%d%s -- %s %s %s %s",
+            "GET_PASSPHRASE --data --repeat=%d%s%s -- %s %s %s %s",
             repeat,
-            check? " --check --qualitybar":"",
+            ((repeat && check) || newsymkey)? " --check":"",
+            (have_newsymkey && newsymkey)? " --newsymkey":"",
             arg1? arg1:"X",
             arg2? arg2:"X",
             arg3? arg3:"X",
@@ -2096,7 +2099,7 @@ keyinfo_status_cb (void *opaque, const char *line)
        *      6        7        8
        *   <sshfpr>  <ttl>  <flags>
        */
-      char *fields[9];
+      const char *fields[9];
 
       if (split_fields (s, fields, DIM (fields)) == 9)
         {
@@ -2323,11 +2326,12 @@ inq_genkey_parms (void *opaque, const char *line)
    gcry_pk_genkey.  If NO_PROTECTION is true the agent is advised not
    to protect the generated key.  If NO_PROTECTION is not set and
    PASSPHRASE is not NULL the agent is requested to protect the key
-   with that passphrase instead of asking for one.  */
+   with that passphrase instead of asking for one.  TIMESTAMP is the
+   creation time of the key or zero.  */
 gpg_error_t
 agent_genkey (ctrl_t ctrl, char **cache_nonce_addr, char **passwd_nonce_addr,
               const char *keyparms, int no_protection,
-              const char *passphrase, gcry_sexp_t *r_pubkey)
+              const char *passphrase, time_t timestamp, gcry_sexp_t *r_pubkey)
 {
   gpg_error_t err;
   struct genkey_parm_s gk_parm;
@@ -2336,6 +2340,7 @@ agent_genkey (ctrl_t ctrl, char **cache_nonce_addr, char **passwd_nonce_addr,
   membuf_t data;
   size_t len;
   unsigned char *buf;
+  char timestamparg[16 + 16];  /* The 2nd 16 is sizeof(gnupg_isotime_t) */
   char line[ASSUAN_LINELENGTH];
 
   memset (&dfltparm, 0, sizeof dfltparm);
@@ -2346,6 +2351,14 @@ agent_genkey (ctrl_t ctrl, char **cache_nonce_addr, char **passwd_nonce_addr,
   if (err)
     return err;
   dfltparm.ctx = agent_ctx;
+
+  if (timestamp)
+    {
+      strcpy (timestamparg, " --timestamp=");
+      epoch2isotime (timestamparg+13, timestamp);
+    }
+  else
+    *timestamparg = 0;
 
   if (passwd_nonce_addr && *passwd_nonce_addr)
     ; /* A RESET would flush the passwd nonce cache.  */
@@ -2361,7 +2374,8 @@ agent_genkey (ctrl_t ctrl, char **cache_nonce_addr, char **passwd_nonce_addr,
   gk_parm.dflt     = &dfltparm;
   gk_parm.keyparms = keyparms;
   gk_parm.passphrase = passphrase;
-  snprintf (line, sizeof line, "GENKEY%s%s%s%s%s",
+  snprintf (line, sizeof line, "GENKEY%s%s%s%s%s%s",
+            *timestamparg? timestamparg : "",
             no_protection? " --no-protection" :
             passphrase   ? " --inq-passwd" :
             /*          */ "",
@@ -2775,11 +2789,12 @@ inq_import_key_parms (void *opaque, const char *line)
 gpg_error_t
 agent_import_key (ctrl_t ctrl, const char *desc, char **cache_nonce_addr,
                   const void *key, size_t keylen, int unattended, int force,
-		  u32 *keyid, u32 *mainkeyid, int pubkey_algo)
+		  u32 *keyid, u32 *mainkeyid, int pubkey_algo, u32 timestamp)
 {
   gpg_error_t err;
   struct import_key_parm_s parm;
   struct cache_nonce_parm_s cn_parm;
+  char timestamparg[16 + 16];  /* The 2nd 16 is sizeof(gnupg_isotime_t) */
   char line[ASSUAN_LINELENGTH];
   struct default_inq_parm_s dfltparm;
 
@@ -2794,6 +2809,14 @@ agent_import_key (ctrl_t ctrl, const char *desc, char **cache_nonce_addr,
     return err;
   dfltparm.ctx = agent_ctx;
 
+  if (timestamp)
+    {
+      strcpy (timestamparg, " --timestamp=");
+      epoch2isotime (timestamparg+13, timestamp);
+    }
+  else
+    *timestamparg = 0;
+
   if (desc)
     {
       snprintf (line, DIM(line), "SETKEYDESC %s", desc);
@@ -2807,7 +2830,8 @@ agent_import_key (ctrl_t ctrl, const char *desc, char **cache_nonce_addr,
   parm.key    = key;
   parm.keylen = keylen;
 
-  snprintf (line, sizeof line, "IMPORT_KEY%s%s%s%s",
+  snprintf (line, sizeof line, "IMPORT_KEY%s%s%s%s%s",
+            *timestamparg? timestamparg : "",
             unattended? " --unattended":"",
             force? " --force":"",
             cache_nonce_addr && *cache_nonce_addr? " ":"",

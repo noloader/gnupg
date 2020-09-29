@@ -26,7 +26,6 @@
 #include <unistd.h>
 #include <time.h>
 #include <stdarg.h>
-#include <assert.h>
 
 #include "gpgsm.h"
 #include <gcrypt.h>
@@ -36,6 +35,10 @@
 #include "../kbx/keybox.h" /* for KEYBOX_FLAG_* */
 #include "../common/i18n.h"
 #include "../common/tlv.h"
+
+
+/* The OID for the authorityInfoAccess's caIssuers.  */
+static const char oidstr_caIssuers[] = "1.3.6.1.5.5.7.48.2";
 
 
 /* Object to keep track of certain root certificates. */
@@ -437,7 +440,7 @@ check_cert_policy (ksba_cert_t cert, int listmode, estream_t fplist)
 
 /* Helper function for find_up.  This resets the key handle and search
    for an issuer ISSUER with a subjectKeyIdentifier of KEYID.  Returns
-   0 on success or -1 when not found. */
+   0 on success or GPG_ERR_NOT_FOUND when not found. */
 static int
 find_up_search_by_keyid (ctrl_t ctrl, KEYDB_HANDLE kh,
                          const char *issuer, ksba_sexp_t keyid)
@@ -457,7 +460,7 @@ find_up_search_by_keyid (ctrl_t ctrl, KEYDB_HANDLE kh,
       if (rc)
         {
           log_error ("keydb_get_cert() failed: rc=%d\n", rc);
-          rc = -1;
+          rc = gpg_error (GPG_ERR_NOT_FOUND);
           goto leave;
         }
       xfree (subj);
@@ -472,7 +475,7 @@ find_up_search_by_keyid (ctrl_t ctrl, KEYDB_HANDLE kh,
               if (rc)
                 {
                   log_error ("keydb_get_validity() failed: rc=%d\n", rc);
-                  rc = -1;
+                  rc = gpg_error (GPG_ERR_NOT_FOUND);
                   goto leave;
                 }
 
@@ -541,7 +544,7 @@ find_up_search_by_keyid (ctrl_t ctrl, KEYDB_HANDLE kh,
   if (rc)
     {
       log_error ("keydb_get_validity() failed: rc=%d\n", rc);
-      rc = -1;
+      rc = gpg_error (GPG_ERR_NOT_FOUND);
       goto leave;
     }
   if (*not_after && strcmp (ctrl->current_time, not_after) > 0 )
@@ -555,7 +558,7 @@ find_up_search_by_keyid (ctrl_t ctrl, KEYDB_HANDLE kh,
       if (rc)
         {
           log_error ("keydb_search_fpr() failed: rc=%d\n", rc);
-          rc = -1;
+          rc = gpg_error (GPG_ERR_NOT_FOUND);
           goto leave;
         }
       /* Ready.  The NE_FOUND_CERT is available via keydb_get_cert.  */
@@ -566,7 +569,7 @@ find_up_search_by_keyid (ctrl_t ctrl, KEYDB_HANDLE kh,
   ksba_cert_release (ne_found_cert);
   ksba_cert_release (cert);
   xfree (subj);
-  return rc? -1:0;
+  return rc? gpg_error (GPG_ERR_NOT_FOUND) : 0;
 }
 
 
@@ -574,6 +577,9 @@ struct find_up_store_certs_s
 {
   ctrl_t ctrl;
   int count;
+  unsigned int want_fpr:1;
+  unsigned int got_fpr:1;
+  unsigned char fpr[20];
 };
 
 static void
@@ -583,6 +589,13 @@ find_up_store_certs_cb (void *cb_value, ksba_cert_t cert)
 
   if (keydb_store_cert (parm->ctrl, cert, 1, NULL))
     log_error ("error storing issuer certificate as ephemeral\n");
+  else if (parm->want_fpr && !parm->got_fpr)
+    {
+      if (!gpgsm_get_fingerprint (cert, 0, parm->fpr, NULL))
+        log_error (_("failed to get the fingerprint\n"));
+      else
+        parm->got_fpr = 1;
+    }
   parm->count++;
 }
 
@@ -603,6 +616,8 @@ find_up_external (ctrl_t ctrl, KEYDB_HANDLE kh,
   const char *s;
 
   find_up_store_certs_parm.ctrl = ctrl;
+  find_up_store_certs_parm.want_fpr = 0;
+  find_up_store_certs_parm.got_fpr = 0;
   find_up_store_certs_parm.count = 0;
 
   if (opt.verbose)
@@ -621,7 +636,7 @@ find_up_external (ctrl_t ctrl, KEYDB_HANDLE kh,
   add_to_strlist (&names, pattern);
   xfree (pattern);
 
-  rc = gpgsm_dirmngr_lookup (ctrl, names, 0, find_up_store_certs_cb,
+  rc = gpgsm_dirmngr_lookup (ctrl, names, NULL, 0, find_up_store_certs_cb,
                              &find_up_store_certs_parm);
   free_strlist (names);
 
@@ -631,10 +646,10 @@ find_up_external (ctrl_t ctrl, KEYDB_HANDLE kh,
   if (rc)
     {
       log_error ("external key lookup failed: %s\n", gpg_strerror (rc));
-      rc = -1;
+      rc = gpg_error (GPG_ERR_NOT_FOUND);
     }
   else if (!find_up_store_certs_parm.count)
-    rc = -1;
+    rc = gpg_err_code (rc) == GPG_ERR_NOT_FOUND;
   else
     {
       int old;
@@ -651,6 +666,105 @@ find_up_external (ctrl_t ctrl, KEYDB_HANDLE kh,
       keydb_set_ephemeral (kh, old);
     }
   return rc;
+}
+
+
+/* Helper for find_up().  Locate the certificate for CERT using the
+ * caIssuer from the authorityInfoAccess.  KH is the keydb context we
+ * are currently using.  On success 0 is returned and the certificate
+ * may be retrieved from the keydb using keydb_get_cert().  If no
+ * suitable authorityInfoAccess is encoded in the certificate
+ * GPG_ERR_NOT_FOUND is returned. */
+static gpg_error_t
+find_up_via_auth_info_access (ctrl_t ctrl, KEYDB_HANDLE kh, ksba_cert_t cert)
+{
+  gpg_error_t err;
+  struct find_up_store_certs_s find_up_store_certs_parm;
+  char *url, *ldapurl;
+  int idx, i;
+  char *oid;
+  ksba_name_t name;
+
+  find_up_store_certs_parm.ctrl = ctrl;
+  find_up_store_certs_parm.want_fpr = 1;
+  find_up_store_certs_parm.got_fpr = 0;
+  find_up_store_certs_parm.count = 0;
+
+  /* Find suitable URLs; if there is a http scheme we prefer that.  */
+  url = ldapurl = NULL;
+  for (idx=0;
+       !url && !(err = ksba_cert_get_authority_info_access (cert, idx,
+                                                            &oid, &name));
+       idx++)
+    {
+      if (!strcmp (oid, oidstr_caIssuers))
+        {
+          for (i=0; !url && ksba_name_enum (name, i); i++)
+            {
+              char *p = ksba_name_get_uri (name, i);
+              if (p)
+                {
+                  if (!strncmp (p, "http:", 5) || !strncmp (p, "https:", 6))
+                    url = p;
+                  else if (ldapurl)
+                    xfree (p); /* We already got one.  */
+                  else if (!strncmp (p, "ldap:",5) || !strncmp (p, "ldaps:",6))
+                    ldapurl = p;
+                }
+              else
+                xfree (p);
+            }
+        }
+      ksba_name_release (name);
+      ksba_free (oid);
+    }
+  if (err && gpg_err_code (err) != GPG_ERR_EOF)
+    {
+      log_error (_("can't get authorityInfoAccess: %s\n"), gpg_strerror (err));
+      return err;
+    }
+  if (!url && ldapurl)
+    {
+      /* No HTTP scheme; fallback to LDAP if available.  */
+      url = ldapurl;
+      ldapurl = NULL;
+    }
+  xfree (ldapurl);
+  if (!url)
+    return gpg_error (GPG_ERR_NOT_FOUND);
+
+  if (opt.verbose)
+    log_info ("looking up issuer via authorityInfoAccess.caIssuers\n");
+
+  err = gpgsm_dirmngr_lookup (ctrl, NULL, url, 0, find_up_store_certs_cb,
+                              &find_up_store_certs_parm);
+
+  /* Although we might receive several certificates we use only the
+   * first one.  Or more exacty the first one for which we retrieved
+   * the fingerprint.  */
+  if (opt.verbose)
+    log_info ("number of caIssuers found: %d\n",
+              find_up_store_certs_parm.count);
+  if (err)
+    {
+      log_error ("external URL lookup failed: %s\n", gpg_strerror (err));
+      err = gpg_error (GPG_ERR_NOT_FOUND);
+    }
+  else if (!find_up_store_certs_parm.got_fpr)
+    err = gpg_error (GPG_ERR_NOT_FOUND);
+  else
+    {
+      int old;
+      /* The retrieved certificates are currently stored in the
+       * ephemeral key DB, so we temporary switch to ephemeral
+       * mode. */
+      old = keydb_set_ephemeral (kh, 1);
+      keydb_search_reset (kh);
+      err = keydb_search_fpr (ctrl, kh, find_up_store_certs_parm.fpr);
+      keydb_set_ephemeral (kh, old);
+    }
+
+  return err;
 }
 
 
@@ -694,7 +808,7 @@ find_up_dirmngr (ctrl_t ctrl, KEYDB_HANDLE kh,
   add_to_strlist (&names, pattern);
   xfree (pattern);
 
-  rc = gpgsm_dirmngr_lookup (ctrl, names, 1, find_up_store_certs_cb,
+  rc = gpgsm_dirmngr_lookup (ctrl, names, NULL, 1, find_up_store_certs_cb,
                              &find_up_store_certs_parm);
   free_strlist (names);
 
@@ -704,7 +818,8 @@ find_up_dirmngr (ctrl_t ctrl, KEYDB_HANDLE kh,
   if (rc && !opt.quiet)
     log_info (_("dirmngr cache-only key lookup failed: %s\n"),
               gpg_strerror (rc));
-  return (!rc && find_up_store_certs_parm.count)? 0 : -1;
+  return ((!rc && find_up_store_certs_parm.count)
+          ? 0 : gpg_error (GPG_ERR_NOT_FOUND));
 }
 
 
@@ -714,7 +829,7 @@ find_up_dirmngr (ctrl_t ctrl, KEYDB_HANDLE kh,
    FIND_NEXT is true, the function shall return the next possible
    issuer.  The certificate itself is not directly returned but a
    keydb_get_cert on the keydb context KH will return it.  Returns 0
-   on success, -1 if not found or an error code.  */
+   on success, GPG_ERR_NOT_FOUND if not found or another error code.  */
 static int
 find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
          ksba_cert_t cert, const char *issuer, int find_next)
@@ -743,13 +858,13 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
              into the ephemeral DB and let the code below do the
              actual retrieve.  Thus there is no error checking.
              Skipped in find_next mode as usual. */
-          if (rc == -1 && !find_next)
+          if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && !find_next)
             find_up_dirmngr (ctrl, kh, authidno, s, 0);
 
           /* In case of an error try the ephemeral DB.  We can't do
              that in find_next mode because we can't keep the search
              state then. */
-          if (rc == -1 && !find_next)
+          if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && !find_next)
             {
               int old = keydb_set_ephemeral (kh, 1);
               if (!old)
@@ -763,11 +878,11 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
                 }
               keydb_set_ephemeral (kh, old);
             }
-          if (rc)
-            rc = -1; /* Need to make sure to have this error code. */
+          if (rc) /* Need to make sure to have this error code. */
+            rc = gpg_error (GPG_ERR_NOT_FOUND);
         }
 
-      if (rc == -1 && keyid && !find_next)
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && keyid && !find_next)
         {
           /* Not found by AKI.issuer_sn.  Lets try the AKI.ki
              instead. Loop over all certificates with that issuer as
@@ -786,13 +901,13 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
                 log_debug ("  found via authid and keyid (ephem)\n");
               keydb_set_ephemeral (kh, old);
             }
-          if (rc)
-            rc = -1; /* Need to make sure to have this error code. */
+          if (rc) /* Need to make sure to have this error code. */
+            rc = gpg_error (GPG_ERR_NOT_FOUND);
         }
 
       /* If we still didn't found it, try to find it via the subject
          from the dirmngr-cache.  */
-      if (rc == -1 && !find_next)
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && !find_next)
         {
           if (!find_up_dirmngr (ctrl, kh, NULL, issuer, 1))
             {
@@ -806,28 +921,42 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
                 }
               keydb_set_ephemeral (kh, old);
             }
-          if (rc)
-            rc = -1; /* Need to make sure to have this error code. */
+          if (rc) /* Need to make sure to have this error code. */
+            rc = gpg_error (GPG_ERR_NOT_FOUND);
 
           if (!rc && DBG_X509)
             log_debug ("  found via authid and issuer from dirmngr cache\n");
         }
 
       /* If we still didn't found it, try an external lookup.  */
-      if (rc == -1 && opt.auto_issuer_key_retrieve && !find_next)
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND
+          && !find_next && !ctrl->offline)
         {
-          rc = find_up_external (ctrl, kh, issuer, keyid);
-          if (!rc && DBG_X509)
-            log_debug ("  found via authid and external lookup\n");
+          /* We allow AIA also if CRLs are enabled; both can be used
+           * as a web bug so it does not make sense to not use AIA if
+           * CRL checks are enabled.  */
+          if ((opt.auto_issuer_key_retrieve || !opt.no_crl_check)
+              && !find_up_via_auth_info_access (ctrl, kh, cert))
+            {
+              if (DBG_X509)
+                log_debug ("  found via authorityInfoAccess.caIssuers\n");
+              rc = 0;
+            }
+          else if (opt.auto_issuer_key_retrieve)
+            {
+              rc = find_up_external (ctrl, kh, issuer, keyid);
+              if (!rc && DBG_X509)
+                log_debug ("  found via authid and external lookup\n");
+            }
         }
 
 
       /* Print a note so that the user does not feel too helpless when
          an issuer certificate was found and gpgsm prints BAD
          signature because it is not the correct one. */
-      if (rc == -1 && opt.quiet)
+      if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && opt.quiet)
         ;
-      else if (rc == -1)
+      else if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND)
         {
           log_info ("%sissuer certificate ", find_next?"next ":"");
           if (keyid)
@@ -855,7 +984,7 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
 
   if (rc) /* Not found via authorithyKeyIdentifier, try regular issuer name. */
     rc = keydb_search_subject (ctrl, kh, issuer);
-  if (rc == -1 && !find_next)
+  if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && !find_next)
     {
       int old;
 
@@ -877,11 +1006,21 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
     }
 
   /* Still not found.  If enabled, try an external lookup.  */
-  if (rc == -1 && opt.auto_issuer_key_retrieve && !find_next)
+  if (gpg_err_code (rc) == GPG_ERR_NOT_FOUND && !find_next && !ctrl->offline)
     {
-      rc = find_up_external (ctrl, kh, issuer, NULL);
-      if (!rc && DBG_X509)
-        log_debug ("  found via issuer and external lookup\n");
+      if ((opt.auto_issuer_key_retrieve || !opt.no_crl_check)
+          && !find_up_via_auth_info_access (ctrl, kh, cert))
+        {
+          if (DBG_X509)
+            log_debug ("  found via authorityInfoAccess.caIssuers\n");
+          rc = 0;
+        }
+      else if (opt.auto_issuer_key_retrieve)
+        {
+          rc = find_up_external (ctrl, kh, issuer, NULL);
+          if (!rc && DBG_X509)
+            log_debug ("  found via issuer and external lookup\n");
+        }
     }
 
   return rc;
@@ -889,14 +1028,14 @@ find_up (ctrl_t ctrl, KEYDB_HANDLE kh,
 
 
 /* Return the next certificate up in the chain starting at START.
-   Returns -1 when there are no more certificates. */
-int
+   Returns GPG_ERR_NOT_FOUND when there are no more certificates. */
+gpg_error_t
 gpgsm_walk_cert_chain (ctrl_t ctrl, ksba_cert_t start, ksba_cert_t *r_next)
 {
   int rc = 0;
   char *issuer = NULL;
   char *subject = NULL;
-  KEYDB_HANDLE kh = keydb_new ();
+  KEYDB_HANDLE kh = keydb_new (ctrl);
 
   *r_next = NULL;
   if (!kh)
@@ -923,7 +1062,7 @@ gpgsm_walk_cert_chain (ctrl_t ctrl, ksba_cert_t start, ksba_cert_t *r_next)
 
   if (is_root_cert (start, issuer, subject))
     {
-      rc = -1; /* we are at the root */
+      rc = gpg_error (GPG_ERR_NOT_FOUND); /* we are at the root */
       goto leave;
     }
 
@@ -932,7 +1071,7 @@ gpgsm_walk_cert_chain (ctrl_t ctrl, ksba_cert_t start, ksba_cert_t *r_next)
     {
       /* It is quite common not to have a certificate, so better don't
          print an error here.  */
-      if (rc != -1 && opt.verbose > 1)
+      if (gpg_err_code (rc) != GPG_ERR_NOT_FOUND && opt.verbose > 1)
         log_error ("failed to find issuer's certificate: rc=%d\n", rc);
       rc = gpg_error (GPG_ERR_MISSING_ISSUER_CERT);
       goto leave;
@@ -1411,7 +1550,7 @@ do_validate_chain (ctrl_t ctrl, ksba_cert_t cert, ksba_isotime_t checktime_arg,
       return 0;
     }
 
-  kh = keydb_new ();
+  kh = keydb_new (ctrl);
   if (!kh)
     {
       log_error (_("failed to allocate keyDB handle\n"));
@@ -2049,7 +2188,7 @@ gpgsm_basic_cert_check (ctrl_t ctrl, ksba_cert_t cert)
       return 0;
     }
 
-  kh = keydb_new ();
+  kh = keydb_new (ctrl);
   if (!kh)
     {
       log_error (_("failed to allocate keyDB handle\n"));
@@ -2203,7 +2342,7 @@ get_regtp_ca_info (ctrl_t ctrl, ksba_cert_t cert, int *chainlen)
       cert = next;
     }
   ksba_cert_release (cert);
-  if (rc != -1 || !depth || depth == DIM(array) )
+  if (gpg_err_code (rc) != GPG_ERR_NOT_FOUND || !depth || depth == DIM(array) )
     {
       /* We did not reached the root. */
       goto leave;

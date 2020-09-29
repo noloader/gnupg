@@ -633,6 +633,16 @@ AC_ISC_POSIX
 AC_SYS_LARGEFILE
 
 
+# GNU AWK requires -n option to interpret "0xHH" as a number
+if $AWK 'BEGIN { if (PROCINFO@<:@"version"@:>@) exit 1 }'; then
+  AWK_HEX_NUMBER_OPTION=''
+  AC_MSG_NOTICE([awk with no option for hexadecimal])
+else
+  AWK_HEX_NUMBER_OPTION='-n'
+  AC_MSG_NOTICE([awk with an option -n for hexadecimal])
+fi
+AC_SUBST(AWK_HEX_NUMBER_OPTION)
+
 # We need to compile and run a program on the build machine.  A
 # comment in libgpg-error says that the AC_PROG_CC_FOR_BUILD macro in
 # the AC archive is broken for autoconf 2.57.  Given that there is no
@@ -1610,6 +1620,7 @@ if test "$GCC" = yes; then
         if test x"$_gcc_wopt" = xyes ; then
           mycflags="$mycflags -W -Wno-sign-compare -Wno-format-zero-length"
           mycflags="$mycflags -Wno-missing-field-initializers"
+          mycflags="$mycflags -Wno-format-zero-length"
         fi
 
         AC_MSG_CHECKING([if gcc supports -Wdeclaration-after-statement])
@@ -1721,6 +1732,16 @@ if test "$run_all_tests" = "yes"; then
 fi
 
 #
+# Configure option --disable-tests
+#
+AC_MSG_CHECKING([whether tests should be run])
+AC_ARG_ENABLE(tests,
+              AC_HELP_STRING([--disable-tests],
+                             [do not run any tests]),
+              run_tests=$enableval, run_tests=yes)
+AC_MSG_RESULT($run_tests)
+
+#
 # We do not want support for the GNUPG_BUILDDIR environment variable
 # in a released version.  However, our regression tests suite requires
 # this and thus we build with support for it during "make distcheck".
@@ -1781,6 +1802,7 @@ AM_CONDITIONAL(BUILD_SYMCRYPTRUN, test "$build_symcryptrun" = "yes")
 AM_CONDITIONAL(BUILD_GPGTAR,      test "$build_gpgtar" = "yes")
 AM_CONDITIONAL(BUILD_WKS_TOOLS,   test "$build_wks_tools" = "yes")
 
+AM_CONDITIONAL(DISABLE_TESTS,       test "$run_tests" != yes)
 AM_CONDITIONAL(ENABLE_CARD_SUPPORT, test "$card_support" = yes)
 AM_CONDITIONAL(NO_TRUST_MODELS,     test "$use_trust_models" = no)
 AM_CONDITIONAL(USE_TOFU,            test "$use_tofu" = yes)
@@ -2076,6 +2098,21 @@ cat <<G10EOF
                  to be used libraries have been detected for:
                   ${gpg_config_script_warn}
                  Please check above for more warning messages.
+
+G10EOF
+fi
+if test "${build_gpg}" != "yes"; then
+cat <<G10EOF
+        Warning: The component "gpg" is used by other components as
+                 well as for the test suite.  You have disabled
+                 this component and thus other things won't work.
+
+G10EOF
+fi
+if test "${run_tests}" != "yes"; then
+cat <<G10EOF
+        Warning: The use of the test suite has been disabled!
+                 This is in almost all cases a bad idea.  Take care.
 
 G10EOF
 fi

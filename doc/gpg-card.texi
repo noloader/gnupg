@@ -105,6 +105,12 @@ Do not start the gpg-agent if it has not yet been started and its
 service is required.  This option is mostly useful on machines where
 the connection to gpg-agent has been redirected to another machines.
 
+@item --no-history
+@opindex --no-history
+In interactive mode the command line history is usually saved and
+restored to and from a file below the GnuPG home directory.  This
+option inhibits the use of that file.
+
 @item --agent-program @var{file}
 @opindex agent-program
 Specify the agent program to be started if none is running.  The
@@ -118,6 +124,16 @@ Specify a non-default gpg binary to be used by certain commands.
 @item --gpgsm-program @var{file}
 @opindex gpgsm-program
 Specify a non-default gpgsm binary to be used by certain commands.
+
+@item --chuid @var{uid}
+@opindex chuid
+Change the current user to @var{uid} which may either be a number or a
+name.  This can be used from the root account to run gpg-card for
+another user.  If @var{uid} is not the current UID a standard PATH is
+set and the envvar GNUPGHOME is unset.  To override the latter the
+option @option{--homedir} can be used.  This option has only an effect
+when used on the command line.  This option has currently no effect at
+all on Windows.
 
 @end table
 

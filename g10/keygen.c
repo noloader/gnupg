@@ -1329,19 +1329,10 @@ ecckey_from_sexp (gcry_mpi_t *array, gcry_sexp_t sexp, int algo)
   if (err)
     goto leave;
 
-  l2 = gcry_sexp_find_token (list, "q", 0);
-  if (!l2)
-    {
-      err = gpg_error (GPG_ERR_NO_OBJ);
-      goto leave;
-    }
-  array[1] = gcry_sexp_nth_mpi (l2, 1, GCRYMPI_FMT_USG);
-  gcry_sexp_release (l2);
-  if (!array[1])
-    {
-      err = gpg_error (GPG_ERR_INV_OBJ);
-      goto leave;
-    }
+  err = sexp_extract_param_sos (list, "q", &array[1]);
+  if (err)
+    goto leave;
+
   gcry_sexp_release (list);
 
   if (algo == PUBKEY_ALGO_ECDH)
@@ -1532,7 +1523,7 @@ common_gen (const char *keyparms, int algo, const char *algoelem,
 
   err = agent_genkey (NULL, cache_nonce_addr, passwd_nonce_addr, keyparms,
                       !!(keygen_flags & KEYGEN_FLAG_NO_PROTECTION),
-                      passphrase,
+                      passphrase, timestamp,
                       &s_key);
   if (err)
     {
@@ -1757,12 +1748,23 @@ gen_ecc (int algo, const char *curve, kbnode_t pub_root,
     curve = "Curve25519";
   else if (!ascii_strcasecmp (curve, "ed25519"))
     curve = "Ed25519";
+  else if (!ascii_strcasecmp (curve, "cv448"))
+    curve = "X448";
+  else if (!ascii_strcasecmp (curve, "ed448"))
+    curve = "Ed448";
 
   /* Note that we use the "comp" flag with EdDSA to request the use of
      a 0x40 compression prefix octet.  */
-  if (algo == PUBKEY_ALGO_EDDSA)
+  if (algo == PUBKEY_ALGO_EDDSA && !strcmp (curve, "Ed25519"))
     keyparms = xtryasprintf
       ("(genkey(ecc(curve %zu:%s)(flags eddsa comp%s)))",
+       strlen (curve), curve,
+       (((keygen_flags & KEYGEN_FLAG_TRANSIENT_KEY)
+         && (keygen_flags & KEYGEN_FLAG_NO_PROTECTION))?
+        " transient-key" : ""));
+  else if (algo == PUBKEY_ALGO_EDDSA && !strcmp (curve, "Ed448"))
+    keyparms = xtryasprintf
+      ("(genkey(ecc(curve %zu:%s)(flags comp%s)))",
        strlen (curve), curve,
        (((keygen_flags & KEYGEN_FLAG_TRANSIENT_KEY)
          && (keygen_flags & KEYGEN_FLAG_NO_PROTECTION))?
@@ -1770,6 +1772,13 @@ gen_ecc (int algo, const char *curve, kbnode_t pub_root,
   else if (algo == PUBKEY_ALGO_ECDH && !strcmp (curve, "Curve25519"))
     keyparms = xtryasprintf
       ("(genkey(ecc(curve %zu:%s)(flags djb-tweak comp%s)))",
+       strlen (curve), curve,
+       (((keygen_flags & KEYGEN_FLAG_TRANSIENT_KEY)
+         && (keygen_flags & KEYGEN_FLAG_NO_PROTECTION))?
+        " transient-key" : ""));
+  else if (algo == PUBKEY_ALGO_ECDH && !strcmp (curve, "X448"))
+    keyparms = xtryasprintf
+      ("(genkey(ecc(curve %zu:%s)(flags comp%s)))",
        strlen (curve), curve,
        (((keygen_flags & KEYGEN_FLAG_TRANSIENT_KEY)
          && (keygen_flags & KEYGEN_FLAG_NO_PROTECTION))?
@@ -1929,8 +1938,14 @@ ask_key_flags_with_mask (int algo, int subkey, unsigned int current,
     }
 
   /* Mask the possible usage flags.  This is for example used for a
-   * card based key.  */
+   * card based key.  For ECDH we need to allows additional usages if
+   * they are provided. */
   possible = (openpgp_pk_algo_usage (algo) & mask);
+  if (algo == PUBKEY_ALGO_ECDH)
+    possible |= (current & (PUBKEY_USAGE_ENC
+                            |PUBKEY_USAGE_CERT
+                            |PUBKEY_USAGE_SIG
+                            |PUBKEY_USAGE_AUTH));
 
   /* However, only primary keys may certify. */
   if (subkey)
@@ -1948,9 +1963,10 @@ ask_key_flags_with_mask (int algo, int subkey, unsigned int current,
     {
       tty_printf("\n");
       tty_printf(_("Possible actions for this %s key: "),
-                 (algo == PUBKEY_ALGO_ECDSA
+                 (algo == PUBKEY_ALGO_ECDH
+                  || algo == PUBKEY_ALGO_ECDSA
                   || algo == PUBKEY_ALGO_EDDSA)
-                 ? "ECDSA/EdDSA" : openpgp_pk_algo_name (algo));
+                 ? "ECC" : openpgp_pk_algo_name (algo));
       print_key_flags(possible);
       tty_printf("\n");
       tty_printf(_("Current allowed actions: "));
@@ -2076,7 +2092,7 @@ check_keygrip (ctrl_t ctrl, const char *hexgrip)
  * keygrip is then stored at this address.  The caller needs to free
  * it.  If R_CARDKEY is not NULL and the keygrip has been taken from
  * an active card, true is stored there; if R_KEYTIME is not NULL the
- * cretion time of that key is then stored there.  */
+ * creation time of that key is then stored there.  */
 static int
 ask_algo (ctrl_t ctrl, int addmode, int *r_subkey_algo, unsigned int *r_usage,
           char **r_keygrip, int *r_cardkey, u32 *r_keytime)
@@ -2308,18 +2324,28 @@ ask_algo (ctrl_t ctrl, int addmode, int *r_subkey_algo, unsigned int *r_usage,
                       gcry_sexp_release (s_pkey);
                     }
 
-                  /* We need to tweak the algo in case
-                   * GCRY_PK_ECC is returned because pubkey_algo_string
-                   * is not aware of the OpenPGP algo mapping.
-                   * FIXME: This is an ugly hack. */
-                  if (algoid == GCRY_PK_ECC
-                      && algostr && !strncmp (algostr, "nistp", 5)
-                      && !(kpi->usage & GCRY_PK_USAGE_ENCR))
-                    kpi->algo = PUBKEY_ALGO_ECDSA;
-                  else if (algoid == GCRY_PK_ECC
-                           && algostr && !strcmp (algostr, "ed25519")
-                           && !(kpi->usage & GCRY_PK_USAGE_ENCR))
-                    kpi->algo = PUBKEY_ALGO_EDDSA;
+                  /* We need to tweak the algo in case GCRY_PK_ECC is
+                   * returned because pubkey_algo_string is not aware
+                   * of the OpenPGP algo mapping.  We need to
+                   * distinguish between ECDH and ECDSA but we can do
+                   * that only if we got usage flags.
+                   * Note: Keep this in sync with parse_key_parameter_part.
+                   */
+                  if (algoid == GCRY_PK_ECC && algostr)
+                    {
+                      if (!strcmp (algostr, "ed25519"))
+                        kpi->algo = PUBKEY_ALGO_EDDSA;
+                      else if (!strcmp (algostr, "ed448"))
+                        kpi->algo = PUBKEY_ALGO_EDDSA;
+                      else if (!strcmp (algostr, "cv25519"))
+                        kpi->algo = PUBKEY_ALGO_ECDH;
+                      else if (!strcmp (algostr, "cv448"))
+                        kpi->algo = PUBKEY_ALGO_ECDH;
+                      else if ((kpi->usage & GCRY_PK_USAGE_ENCR))
+                        kpi->algo = PUBKEY_ALGO_ECDH;
+                      else
+                        kpi->algo = PUBKEY_ALGO_ECDSA;
+                    }
                   else
                     kpi->algo = map_gcry_pk_to_openpgp (algoid);
 
@@ -2586,7 +2612,7 @@ ask_curve (int *algo, int *subkey_algo, const char *current)
 # define MY_USE_ECDSADH 0
 #endif
     { "Curve25519",      "Ed25519", "Curve 25519", !!GPG_USE_EDDSA, 0, 0, 0 },
-    { "Curve448",        "Ed448",   "Curve 448",   0/*reserved*/  , 0, 1, 0 },
+    { "X448",            "Ed448",   "Curve 448",   !!GPG_USE_EDDSA, 0, 1, 0 },
     { "NIST P-256",      NULL, NULL,               MY_USE_ECDSADH,  0, 1, 0 },
     { "NIST P-384",      NULL, NULL,               MY_USE_ECDSADH,  0, 0, 0 },
     { "NIST P-521",      NULL, NULL,               MY_USE_ECDSADH,  0, 1, 0 },
@@ -3456,17 +3482,27 @@ parse_key_parameter_part (ctrl_t ctrl,
           gcry_sexp_release (s_pkey);
 
           /* Map to OpenPGP algo number.
-           * We need to tweak the algo in case GCRY_PK_ECC is returned
-           * because pubkey_algo_string is not aware of the OpenPGP
-           * algo mapping.  FIXME: This is an ugly hack. */
-          if (algoid == GCRY_PK_ECC
-              && algostr && !strncmp (algostr, "nistp", 5)
-              && !(kpi->usage & GCRY_PK_USAGE_ENCR))
-            algo = PUBKEY_ALGO_ECDSA;
-          else if (algoid == GCRY_PK_ECC
-                   && algostr && !strcmp (algostr, "ed25519")
-                   && !(kpi->usage & GCRY_PK_USAGE_ENCR))
-            algo = PUBKEY_ALGO_EDDSA;
+           * We need to tweak the algo in case GCRY_PK_ECC is
+           * returned because pubkey_algo_string is not aware
+           * of the OpenPGP algo mapping.  We need to
+           * distinguish between ECDH and ECDSA but we can do
+           * that only if we got usage flags.
+           * Note: Keep this in sync with ask_algo.  */
+          if (algoid == GCRY_PK_ECC && algostr)
+            {
+              if (!strcmp (algostr, "ed25519"))
+                algo = PUBKEY_ALGO_EDDSA;
+              else if (!strcmp (algostr, "ed448"))
+                kpi->algo = PUBKEY_ALGO_EDDSA;
+              else if (!strcmp (algostr, "cv25519"))
+                algo = PUBKEY_ALGO_ECDH;
+              else if (!strcmp (algostr, "cv448"))
+                algo = PUBKEY_ALGO_ECDH;
+              else if ((kpi->usage & GCRY_PK_USAGE_ENCR))
+                algo = PUBKEY_ALGO_ECDH;
+              else
+                algo = PUBKEY_ALGO_ECDSA;
+            }
           else
             algo = map_gcry_pk_to_openpgp (algoid);
 
@@ -3588,7 +3624,9 @@ parse_key_parameter_part (ctrl_t ctrl,
  *   dsa2048 := DSA with 2048 bit.
  *   elg2048 := Elgamal with 2048 bit.
  *   ed25519 := EDDSA using curve Ed25519.
+ *   ed448   := EDDSA using curve Ed448.
  *   cv25519 := ECDH using curve Curve25519.
+ *   cv448   := ECDH using curve X448.
  *   nistp256:= ECDSA or ECDH using curve NIST P-256
  *
  * All strings with an unknown prefix are considered an elliptic
@@ -4270,6 +4308,7 @@ read_parameter_file (ctrl_t ctrl, const char *fname )
     para = NULL;
     maxlen = 1024;
     line = NULL;
+    nline = 0;
     while ( iobuf_read_line (fp, &line, &nline, &maxlen) ) {
 	char *keyword, *value;
 
@@ -4934,7 +4973,10 @@ generate_keypair (ctrl_t ctrl, int full, const char *fname,
                     {
                       /* Need to switch to a different curve for the
                          encryption key.  */
-                      curve = "Curve25519";
+                      if (!strcmp (curve, "Ed25519"))
+                        curve = "Curve25519";
+                      else
+                        curve = "X448";
                     }
                   r = xmalloc_clear (sizeof *r + strlen (curve));
                   r->key = pSUBKEYCURVE;
@@ -5777,7 +5819,8 @@ generate_subkeypair (ctrl_t ctrl, kbnode_t keyblock, const char *algostr,
 
   if (interactive)
     {
-      algo = ask_algo (ctrl, 1, NULL, &use, &key_from_hexgrip, &cardkey, NULL);
+      algo = ask_algo (ctrl, 1, NULL, &use, &key_from_hexgrip, &cardkey,
+                       &keytime);
       log_assert (algo);
 
       if (key_from_hexgrip)

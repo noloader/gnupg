@@ -185,6 +185,12 @@ gpg_error_t make_canon_sexp_pad (gcry_sexp_t sexp, int secure,
 gpg_error_t keygrip_from_canon_sexp (const unsigned char *key, size_t keylen,
                                      unsigned char *grip);
 int cmp_simple_canon_sexp (const unsigned char *a, const unsigned char *b);
+int cmp_canon_sexp (const unsigned char *a, size_t alen,
+                    const unsigned char *b, size_t blen,
+                    int (*tcmp)(void *ctx, int depth,
+                                const unsigned char *aval, size_t avallen,
+                                const unsigned char *bval, size_t bvallen),
+                    void *tcmpctx);
 unsigned char *make_simple_sexp_from_hexstr (const char *line,
                                              size_t *nscanned);
 int hash_algo_from_sigval (const unsigned char *sigval);
@@ -197,12 +203,18 @@ gpg_error_t get_rsa_pk_from_canon_sexp (const unsigned char *keydata,
                                         size_t *r_nlen,
                                         unsigned char const **r_e,
                                         size_t *r_elen);
+gpg_error_t get_ecc_q_from_canon_sexp (const unsigned char *keydata,
+                                       size_t keydatalen,
+                                       unsigned char const **r_q,
+                                       size_t *r_qlen);
 
 int get_pk_algo_from_key (gcry_sexp_t key);
 int get_pk_algo_from_canon_sexp (const unsigned char *keydata,
                                  size_t keydatalen);
 char *pubkey_algo_string (gcry_sexp_t s_pkey, enum gcry_pk_algos *r_algoid);
+const char *pubkey_algo_to_string (int algo);
 const char *hash_algo_to_string (int algo);
+const char *cipher_mode_to_string (int mode);
 
 /*-- convert.c --*/
 int hex2bin (const char *string, void *buffer, size_t length);
@@ -232,6 +244,7 @@ int openpgp_oidbuf_is_ed25519 (const void *buf, size_t len);
 int openpgp_oid_is_ed25519 (gcry_mpi_t a);
 int openpgp_oidbuf_is_cv25519 (const void *buf, size_t len);
 int openpgp_oid_is_cv25519 (gcry_mpi_t a);
+int openpgp_oid_is_cv448 (gcry_mpi_t a);
 const char *openpgp_curve_to_oid (const char *name,
                                   unsigned int *r_nbits, int *r_algo);
 const char *openpgp_oid_to_curve (const char *oid, int canon);
@@ -260,6 +273,7 @@ const char *gnupg_localedir (void);
 const char *gnupg_cachedir (void);
 const char *gpg_agent_socket_name (void);
 const char *dirmngr_socket_name (void);
+const char *keyboxd_socket_name (void);
 
 char *_gnupg_socketdir_internal (int skip_checks, unsigned *r_info);
 

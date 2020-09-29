@@ -24,7 +24,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
-#include <assert.h>
 
 #include "gpgsm.h"
 #include <gcrypt.h>
@@ -113,7 +112,9 @@ check_keygrip (ctrl_t ctrl, const char *hexgrip)
     case GCRY_PK_RSA:   return "RSA";
     case GCRY_PK_DSA:   return "DSA";
     case GCRY_PK_ELG:   return "ELG";
-    case GCRY_PK_EDDSA: return "ECDSA";
+    case GCRY_PK_ECC:   return "ECC";
+    case GCRY_PK_ECDSA: return "ECDSA";
+    case GCRY_PK_EDDSA: return "EdDSA";
     default: return NULL;
     }
 }

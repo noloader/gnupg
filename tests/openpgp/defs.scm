@@ -123,6 +123,7 @@
 
 (define bin-prefix (getenv "BIN_PREFIX"))
 (define installed? (not (string=? "" bin-prefix)))
+(define with-valgrind? (not (string=? (getenv "with_valgrind") "")))
 
 (define (tool-hardcoded which)
   (let ((t (assoc which tools)))
@@ -138,7 +139,8 @@
 ;; (set! gpg `(,@valgrind ,@gpg))
 ;;
 (define valgrind
-  '("/usr/bin/valgrind" --leak-check=full --error-exitcode=154))
+  '("/usr/bin/valgrind" -q --leak-check=no --track-origins=yes
+                        --error-exitcode=154 --exit-on-first-error=yes))
 
 (unless installed?
 	(setenv "GNUPG_BUILDDIR" (getenv "objdir") #t))
@@ -214,7 +216,7 @@
   (tr:spawn input `(,@GPG --output **out** ,@args **in**)))
 
 (define (pipe:gpg args)
-  (pipe:spawn `(,@GPG --output - ,@args -)))
+  (pipe:spawn `(,@GPG --output - ,@args)))
 
 (define (gpg-with-colons args)
   (let ((s (call-popen `(,@GPG --with-colons ,@args) "")))
@@ -334,6 +336,8 @@
       (create-file "pubring.gpg"))
 
   (create-file "gpg.conf"
+               ;;"log-file socket:///tmp/S.wklog"
+               ;;"verbose"
 	       "no-greeting"
 	       "no-secmem-warning"
 	       "no-permission-warning"
@@ -347,14 +351,20 @@
 	       (string-append "agent-program "
 			      (tool 'gpg-agent)
 			      "|--debug-quick-random\n")
+	       (if (flag "--use-keyboxd" *args*)
+		   "use-keyboxd" "#use-keyboxd")
 	       )
+  (create-file "keyboxd.conf"
+               ;;"log-file socket:///tmp/S.wklog"
+               ;;"verbose"
+               ;;"debug ipc"
+	       )
+
   (create-file "gpg-agent.conf"
 	       "allow-preset-passphrase"
 	       "no-grab"
 	       "enable-ssh-support"
                "s2k-count 65536"
-	       (if (flag "--extended-key-format" *args*)
-		   "enable-extended-key-format" "#enable-extended-key-format")
 	       (string-append "pinentry-program " (tool 'pinentry))
 	       "disable-scdaemon"))
 
@@ -494,6 +504,16 @@
     (unless (string=? trust expected-trust)
 	    (fail keyid ": Expected trust to be" expected-trust
 		   "but got" trust))))
+
+
+;;
+;; Enable checking with valgrind if the envvar "with_valgrind" is set
+;;
+(when with-valgrind?
+  (set! gpg `(,@valgrind ,@gpg)))
+
+
+;;(set! *args* (append *args* (list "--use-keyboxd")))
 
 
 ;; end

@@ -36,8 +36,14 @@
 #include "../common/ksba-io-support.h"
 #include "../common/compliance.h"
 
+/* The maximum length of a binary fingerprints.  This is used to
+ * provide a static buffer and will be increased if we need to support
+ * longer fingerprints.  */
+#define MAX_FINGERPRINT_LEN 32
 
-#define MAX_DIGEST_LEN 64
+/* The maximum length of a binary digest.  */
+#define MAX_DIGEST_LEN 64     /* Fits for SHA-512 */
+
 
 struct keyserver_spec
 {
@@ -64,9 +70,12 @@ struct
   int answer_no;    /* assume no on most questions */
   int dry_run;      /* don't change any persistent data */
   int no_homedir_creation;
+  int use_keyboxd;  /* Use the external keyboxd as storage backend.  */
 
   const char *config_filename; /* Name of the used config file. */
   const char *agent_program;
+
+  const char *keyboxd_program;
 
   session_env_t session_env;
   char *lc_ctype;
@@ -105,6 +114,8 @@ struct
   int def_compress_algo;  /* Ditto for compress algorithm */
 
   int forced_digest_algo; /* User forced hash algorithm. */
+
+  int force_ecdh_sha1kdf; /* Only for debugging and testing.  */
 
   char *def_recipient;    /* userID of the default recipient */
   int def_recipient_self; /* The default recipient is the default key */
@@ -193,6 +204,11 @@ struct
 /* Forward declaration for an object defined in server.c */
 struct server_local_s;
 
+/* Object used to keep state locally in keydb.c  */
+struct keydb_local_s;
+typedef struct keydb_local_s *keydb_local_t;
+
+
 /* Session control object.  This object is passed down to most
    functions.  Note that the default values for it are set by
    gpgsm_init_default_ctrl(). */
@@ -201,6 +217,8 @@ struct server_control_s
   int no_server;      /* We are not running under server control */
   int  status_fd;     /* Only for non-server mode */
   struct server_local_s *server_local;
+
+  keydb_local_t keydb_local;  /* Local data for call-keyboxd.c  */
 
   audit_ctx_t audit;  /* NULL or a context for the audit subsystem.  */
   int agent_seen;     /* Flag indicating that the gpg-agent has been
@@ -243,6 +261,7 @@ struct certlist_s
   ksba_cert_t cert;
   int is_encrypt_to; /* True if the certificate has been set through
                         the --encrypto-to option. */
+  int pk_algo;       /* The PK_ALGO from CERT or 0 if not yet known.  */
   int hash_algo;     /* Used to track the hash algorithm to use.  */
   const char *hash_algo_oid;  /* And the corresponding OID.  */
 };
@@ -263,6 +282,7 @@ struct rootca_flags_s
 /*-- gpgsm.c --*/
 void gpgsm_exit (int rc);
 void gpgsm_init_default_ctrl (struct server_control_s *ctrl);
+void gpgsm_deinit_default_ctrl (ctrl_t ctrl);
 int  gpgsm_parse_validation_model (const char *model);
 
 /*-- server.c --*/
@@ -286,12 +306,17 @@ unsigned long gpgsm_get_short_fingerprint (ksba_cert_t cert,
 unsigned char *gpgsm_get_keygrip (ksba_cert_t cert, unsigned char *array);
 char *gpgsm_get_keygrip_hexstring (ksba_cert_t cert);
 int  gpgsm_get_key_algo_info (ksba_cert_t cert, unsigned int *nbits);
+int  gpgsm_get_key_algo_info2 (ksba_cert_t cert, unsigned int *nbits,
+                               char **r_curve);
+char *gpgsm_pubkey_algo_string (ksba_cert_t cert, int *r_algoid);
 gcry_mpi_t gpgsm_get_rsa_modulus (ksba_cert_t cert);
 char *gpgsm_get_certid (ksba_cert_t cert);
 
 
 /*-- certdump.c --*/
+const void *gpgsm_get_serial (ksba_const_sexp_t sn, size_t *r_length);
 void gpgsm_print_serial (estream_t fp, ksba_const_sexp_t p);
+void gpgsm_print_serial_decimal (estream_t fp, ksba_const_sexp_t sn);
 void gpgsm_print_time (estream_t fp, ksba_isotime_t t);
 void gpgsm_print_name2 (FILE *fp, const char *string, int translate);
 void gpgsm_print_name (FILE *fp, const char *string);
@@ -317,8 +342,10 @@ char *gpgsm_format_keydesc (ksba_cert_t cert);
 
 /*-- certcheck.c --*/
 int gpgsm_check_cert_sig (ksba_cert_t issuer_cert, ksba_cert_t cert);
-int gpgsm_check_cms_signature (ksba_cert_t cert, ksba_const_sexp_t sigval,
-                               gcry_md_hd_t md, int hash_algo, int *r_pkalgo);
+int gpgsm_check_cms_signature (ksba_cert_t cert, gcry_sexp_t sigval,
+                               gcry_md_hd_t md,
+                               int hash_algo, unsigned int pkalgoflags,
+                               int *r_pkalgo);
 /* fixme: move create functions to another file */
 int gpgsm_create_cms_signature (ctrl_t ctrl,
                                 ksba_cert_t cert, gcry_md_hd_t md, int mdalgo,
@@ -332,8 +359,8 @@ int gpgsm_create_cms_signature (ctrl_t ctrl,
 #define VALIDATE_FLAG_CHAIN_MODEL 2
 #define VALIDATE_FLAG_STEED       4
 
-int gpgsm_walk_cert_chain (ctrl_t ctrl,
-                           ksba_cert_t start, ksba_cert_t *r_next);
+gpg_error_t gpgsm_walk_cert_chain (ctrl_t ctrl,
+                                   ksba_cert_t start, ksba_cert_t *r_next);
 int gpgsm_is_root_cert (ksba_cert_t cert);
 int gpgsm_validate_chain (ctrl_t ctrl, ksba_cert_t cert,
                           ksba_isotime_t checktime,
@@ -389,6 +416,10 @@ int gpgsm_encrypt (ctrl_t ctrl, certlist_t recplist,
                    int in_fd, estream_t out_fp);
 
 /*-- decrypt.c --*/
+gpg_error_t ecdh_derive_kek (unsigned char *key, unsigned int keylen,
+                             int hash_algo, const char *wrap_algo_str,
+                             const void *secret, unsigned int secretlen,
+                             const void *ukm, unsigned int ukmlen);
 int gpgsm_decrypt (ctrl_t ctrl, int in_fd, estream_t out_fp);
 
 /*-- certreqgen.c --*/
@@ -447,7 +478,8 @@ gpg_error_t gpgsm_agent_export_key (ctrl_t ctrl, const char *keygrip,
 int gpgsm_dirmngr_isvalid (ctrl_t ctrl,
                            ksba_cert_t cert, ksba_cert_t issuer_cert,
                            int use_ocsp);
-int gpgsm_dirmngr_lookup (ctrl_t ctrl, strlist_t names, int cache_only,
+int gpgsm_dirmngr_lookup (ctrl_t ctrl, strlist_t names, const char *uri,
+                          int cache_only,
                           void (*cb)(void*, ksba_cert_t), void *cb_value);
 int gpgsm_dirmngr_run_command (ctrl_t ctrl, const char *command,
                                int argc, char **argv);
@@ -459,6 +491,9 @@ gpg_error_t transform_sigval (const unsigned char *sigval, size_t sigvallen,
                               int mdalgo,
                               unsigned char **r_newsigval,
                               size_t *r_newsigvallen);
+gcry_sexp_t gpgsm_ksba_cms_get_sig_val (ksba_cms_t cms, int idx);
+int gpgsm_get_hash_algo_from_sigval (gcry_sexp_t sigval,
+                                     unsigned int *r_pkalgo_flags);
 
 
 

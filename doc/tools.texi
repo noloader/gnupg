@@ -415,6 +415,16 @@ Try to be as quiet as possible.
 
 @include opt-homedir.texi
 
+@item --chuid @var{uid}
+@opindex chuid
+Change the current user to @var{uid} which may either be a number or a
+name.  This can be used from the root account to get information on
+the GnuPG environment of the specified user or to start or kill
+daemons.  If @var{uid} is not the current UID a standard PATH is set
+and the envvar GNUPGHOME is unset.  To override the latter the option
+@option{--homedir} can be used.  This option has currently no effect
+on Windows.
+
 @item -n
 @itemx --dry-run
 Do not actually change anything.  This is currently only implemented
@@ -1320,39 +1330,6 @@ gpg-connect-agent [options] [commands]
 The following options may be used:
 
 @table @gnupgtabopt
-@item -v
-@itemx --verbose
-@opindex verbose
-Output additional information while running.
-
-@item -q
-@item --quiet
-@opindex q
-@opindex quiet
-Try to be as quiet as possible.
-
-@include opt-homedir.texi
-
-@item --agent-program @var{file}
-@opindex agent-program
-Specify the agent program to be started if none is running.  The
-default value is determined by running @command{gpgconf} with the
-option @option{--list-dirs}.  Note that the pipe symbol (@code{|}) is
-used for a regression test suite hack and may thus not be used in the
-file name.
-
-@item --dirmngr-program @var{file}
-@opindex dirmngr-program
-Specify the directory manager (keyserver client) program to be started
-if none is running.  This has only an effect if used together with the
-option @option{--dirmngr}.
-
-@item --keyboxd-program @var{file}
-@opindex keyboxd-program
-Specify the keybox daemon program to be started if none is running.
-This has only an effect if used together with the option
-@option{--keyboxd}.
-
 @item --dirmngr
 @opindex dirmngr
 Connect to a running directory manager (keyserver client) instead of
@@ -1380,6 +1357,29 @@ execute it as an Assuan server. Here is how you would run @command{gpgsm}:
 @end smallexample
 Note that you may not use options on the command line in this case.
 
+@item -v
+@itemx --verbose
+@opindex verbose
+Output additional information while running.
+
+@item -q
+@item --quiet
+@opindex q
+@opindex quiet
+Try to be as quiet as possible.
+
+@include opt-homedir.texi
+
+@item --chuid @var{uid}
+@opindex chuid
+Change the current user to @var{uid} which may either be a number or a
+name.  This can be used from the root account to run gpg-connect-agent
+for another user.  If @var{uid} is not the current UID a standard PATH
+is set and the envvar GNUPGHOME is unset.  To override the latter the
+option @option{--homedir} can be used.  This option has only an effect
+when used on the command line.  This option has currently no effect at
+all on Windows.
+
 @item --no-ext-connect
 @opindex no-ext-connect
 When using @option{-S} or @option{--exec}, @command{gpg-connect-agent}
@@ -1390,6 +1390,32 @@ passing.  This option makes it use the old mode.
 @opindex no-autostart
 Do not start the gpg-agent or the dirmngr if it has not yet been
 started.
+
+@item --no-history
+@opindex --no-history
+In interactive mode the command line history is usually saved and
+restored to and from a file below the GnuPG home directory.  This
+option inhibits the use of that file.
+
+@item --agent-program @var{file}
+@opindex agent-program
+Specify the agent program to be started if none is running.  The
+default value is determined by running @command{gpgconf} with the
+option @option{--list-dirs}.  Note that the pipe symbol (@code{|}) is
+used for a regression test suite hack and may thus not be used in the
+file name.
+
+@item --dirmngr-program @var{file}
+@opindex dirmngr-program
+Specify the directory manager (keyserver client) program to be started
+if none is running.  This has only an effect if used together with the
+option @option{--dirmngr}.
+
+@item --keyboxd-program @var{file}
+@opindex keyboxd-program
+Specify the keybox daemon program to be started if none is running.
+This has only an effect if used together with the option
+@option{--keyboxd}.
 
 @item -r @var{file}
 @itemx --run @var{file}
@@ -1610,6 +1636,9 @@ string @code{true} or @code{yes}.  The evaluation is done by passing
 
 @item /run @var{file}
 Run commands from @var{file}.
+
+@item /history --clear
+Clear the command history.
 
 @item /bye
 Terminate the connection and the program.
@@ -2064,6 +2093,12 @@ line.
 Modify option @option{--files-from} to use a binary nul instead of a
 linefeed to separate file names.
 
+@item --utf8-strings
+@opindex utf8-strings
+Assume that the file names read by @option{--files-from} are UTF-8
+encoded.  This option has an effect only on Windows where the active
+code page is otherwise assumed.
+
 @item --openpgp
 @opindex openpgp
 This option has no effect because OpenPGP encryption and signing is
@@ -2097,6 +2132,11 @@ Assume @var{args} are standard options of the command @command{tar}
 and parse them.  The only supported tar options are "--directory",
 "--files-from", and "--null" This is an obsolete options because those
 supported tar options can also be given directly.
+
+@item --tar @var{command}
+@opindex tar
+This is a dummy option for backward compatibility.
+@c ... to the gpg-zip script we provided in the past
 
 @item --version
 @opindex version

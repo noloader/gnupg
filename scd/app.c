@@ -37,6 +37,7 @@ static gpg_error_t
 select_additional_application_internal (card_t card, apptype_t req_apptype);
 static gpg_error_t
 send_serialno_and_app_status (card_t card, int with_apps, ctrl_t ctrl);
+static gpg_error_t run_reselect (ctrl_t ctrl, card_t c, app_t a, app_t a_prev);
 
 /* Lock to protect the list of cards and its associated
  * applications.  */
@@ -82,8 +83,10 @@ strcardtype (cardtype_t t)
 {
   switch (t)
     {
-    case CARDTYPE_GENERIC: return "generic";
-    case CARDTYPE_YUBIKEY: return "yubikey";
+    case CARDTYPE_GENERIC:     return "generic";
+    case CARDTYPE_GNUK:        return "gnuk";
+    case CARDTYPE_YUBIKEY:     return "yubikey";
+    case CARDTYPE_ZEITCONTROL: return "zeitcontrol";
     }
   return "?";
 }
@@ -539,6 +542,22 @@ app_new_register (int slot, ctrl_t ctrl, const char *name,
               xfree (buf);
             }
         }
+      else
+        {
+          unsigned char *atr;
+          size_t atrlen;
+
+          /* This is heuristics to identify different implementations.  */
+          atr = apdu_get_atr (slot, &atrlen);
+          if (atr)
+            {
+              if (atrlen == 21 && atr[2] == 0x11)
+                card->cardtype = CARDTYPE_GNUK;
+              else if (atrlen == 21 && atr[7] == 0x75)
+                card->cardtype = CARDTYPE_ZEITCONTROL;
+              xfree (atr);
+            }
+        }
 
       if (!err)
         err = iso7816_select_file (slot, 0x2F02, 0);
@@ -880,11 +899,12 @@ select_additional_application_internal (card_t card, apptype_t req_apptype)
 /* Add all possible additional applications to the card context but do
  * not change the current one.  This currently works only for Yubikeys. */
 static gpg_error_t
-select_all_additional_applications_internal (card_t card)
+select_all_additional_applications_internal (ctrl_t ctrl, card_t card)
 {
   gpg_error_t err = 0;
   apptype_t candidates[3];
   int i, j;
+  int any_new = 0;
 
   if (card->cardtype == CARDTYPE_YUBIKEY)
     {
@@ -940,8 +960,14 @@ select_all_additional_applications_internal (card_t card)
           app_prev->next = app;
           log_info ("added app '%s' to the card context\n",
                     strapptype (app->apptype));
+          any_new = 1;
         }
     }
+
+  /* If we found a new application we need to reselect the original
+   * application so that we are in a well defined state.  */
+  if (!err && any_new && card->app && card->app->fnc.reselect)
+    err = run_reselect (ctrl, card, card->app, NULL);
 
  leave:
   return err;
@@ -988,7 +1014,7 @@ select_additional_application (ctrl_t ctrl, const char *name)
     }
   else
     {
-      err = select_all_additional_applications_internal (card);
+      err = select_all_additional_applications_internal (ctrl, card);
     }
 
   unlock_card (card);
@@ -2095,7 +2121,7 @@ send_serialno_and_app_status (card_t card, int with_apps, ctrl_t ctrl)
       /* Note that in case the additional applications have not yet been
        * added to the card context (which is commonly done by means of
        * "SERIALNO --all", we do that here.  */
-      err = select_all_additional_applications_internal (card);
+      err = select_all_additional_applications_internal (ctrl, card);
       if (err)
         return err;
 
@@ -2142,6 +2168,11 @@ send_card_and_app_list (ctrl_t ctrl, card_t wantcard, int with_apps)
   npth_mutex_lock (&card_list_lock);
   for (n=0, c = card_top; c; c = c->next)
     n++;
+  if (!n)
+    {
+      err = gpg_error (GPG_ERR_CARD_NOT_PRESENT);
+      goto leave;
+    }
   cardlist = xtrycalloc (n, sizeof *cardlist);
   if (!cardlist)
     {
@@ -2205,7 +2236,7 @@ app_switch_active_app (card_t card, ctrl_t ctrl, const char *appname)
   /* Note that in case the additional applications have not yet been
    * added to the card context (which is commonly done by means of
    * "SERIALNO --all", we do that here.  */
-  err = select_all_additional_applications_internal (card);
+  err = select_all_additional_applications_internal (ctrl, card);
   if (err)
     goto leave;
 

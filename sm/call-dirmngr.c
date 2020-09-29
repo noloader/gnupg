@@ -25,7 +25,6 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
-#include <assert.h>
 #include <ctype.h>
 
 #include "gpgsm.h"
@@ -156,39 +155,9 @@ static gpg_error_t
 warn_version_mismatch (ctrl_t ctrl, assuan_context_t ctx,
                        const char *servername, int mode)
 {
-  gpg_error_t err;
-  char *serverversion;
-  const char *myversion = gpgrt_strusage (13);
-
-  err = get_assuan_server_version (ctx, mode, &serverversion);
-  if (err)
-    log_error (_("error getting version from '%s': %s\n"),
-               servername, gpg_strerror (err));
-  else if (compare_version_strings (serverversion, myversion) < 0)
-    {
-      char *warn;
-
-      warn = xtryasprintf (_("server '%s' is older than us (%s < %s)"),
-                           servername, serverversion, myversion);
-      if (!warn)
-        err = gpg_error_from_syserror ();
-      else
-        {
-          log_info (_("WARNING: %s\n"), warn);
-          if (!opt.quiet)
-            {
-              log_info (_("Note: Outdated servers may lack important"
-                          " security fixes.\n"));
-              log_info (_("Note: Use the command \"%s\" to restart them.\n"),
-                        "gpgconf --kill all");
-            }
-          gpgsm_status2 (ctrl, STATUS_WARNING, "server_version_mismatch 0",
-                         warn, NULL);
-          xfree (warn);
-        }
-    }
-  xfree (serverversion);
-  return err;
+  return warn_server_version_mismatch (ctx, servername, mode,
+                                       gpgsm_status2, ctrl,
+                                       !opt.quiet);
 }
 
 
@@ -283,7 +252,7 @@ start_dirmngr (ctrl_t ctrl)
 {
   gpg_error_t err;
 
-  assert (! dirmngr_ctx_locked);
+  log_assert (! dirmngr_ctx_locked);
   dirmngr_ctx_locked = 1;
 
   err = start_dirmngr_ext (ctrl, &dirmngr_ctx);
@@ -313,7 +282,7 @@ start_dirmngr2 (ctrl_t ctrl)
 {
   gpg_error_t err;
 
-  assert (! dirmngr2_ctx_locked);
+  log_assert (! dirmngr2_ctx_locked);
   dirmngr2_ctx_locked = 1;
 
   err = start_dirmngr_ext (ctrl, &dirmngr2_ctx);
@@ -578,7 +547,7 @@ gpgsm_dirmngr_isvalid (ctrl_t ctrl,
                  from the dirmngr.  Try our own cert store now.  */
               KEYDB_HANDLE kh;
 
-              kh = keydb_new ();
+              kh = keydb_new (ctrl);
               if (!kh)
                 rc = gpg_error (GPG_ERR_ENOMEM);
               if (!rc)
@@ -757,20 +726,24 @@ lookup_status_cb (void *opaque, const char *line)
 
 
 /* Run the Directory Manager's lookup command using the pattern
-   compiled from the strings given in NAMES.  The caller must provide
-   the callback CB which will be passed cert by cert.  Note that CTRL
-   is optional.  With CACHE_ONLY the dirmngr will search only its own
-   key cache. */
+   compiled from the strings given in NAMES or from URI.  The caller
+   must provide the callback CB which will be passed cert by cert.
+   Note that CTRL is optional.  With CACHE_ONLY the dirmngr will
+   search only its own key cache. */
 int
-gpgsm_dirmngr_lookup (ctrl_t ctrl, strlist_t names, int cache_only,
+gpgsm_dirmngr_lookup (ctrl_t ctrl, strlist_t names, const char *uri,
+                      int cache_only,
                       void (*cb)(void*, ksba_cert_t), void *cb_value)
 {
   int rc;
-  char *pattern;
   char line[ASSUAN_LINELENGTH];
   struct lookup_parm_s parm;
   size_t len;
   assuan_context_t ctx;
+  const char *s;
+
+  if ((names && uri) || (!names && !uri))
+    return gpg_error (GPG_ERR_INV_ARG);
 
   /* The lookup function can be invoked from the callback of a lookup
      function, for example to walk the chain.  */
@@ -793,19 +766,35 @@ gpgsm_dirmngr_lookup (ctrl_t ctrl, strlist_t names, int cache_only,
       log_fatal ("both dirmngr contexts are in use\n");
     }
 
-  pattern = pattern_from_strlist (names);
-  if (!pattern)
+  if (names)
     {
-      if (ctx == dirmngr_ctx)
-	release_dirmngr (ctrl);
-      else
-	release_dirmngr2 (ctrl);
+      char *pattern = pattern_from_strlist (names);
+      if (!pattern)
+        {
+          if (ctx == dirmngr_ctx)
+            release_dirmngr (ctrl);
+          else
+            release_dirmngr2 (ctrl);
 
-      return out_of_core ();
+          return out_of_core ();
+        }
+      snprintf (line, DIM(line), "LOOKUP%s %s",
+                cache_only? " --cache-only":"", pattern);
+      xfree (pattern);
     }
-  snprintf (line, DIM(line), "LOOKUP%s %s",
-            cache_only? " --cache-only":"", pattern);
-  xfree (pattern);
+  else
+    {
+      for (s=uri; *s; s++)
+        if (*s <= ' ')
+          {
+            if (ctx == dirmngr_ctx)
+              release_dirmngr (ctrl);
+            else
+              release_dirmngr2 (ctrl);
+            return gpg_error (GPG_ERR_INV_URI);
+          }
+      snprintf (line, DIM(line), "LOOKUP --url %s", uri);
+    }
 
   parm.ctrl = ctrl;
   parm.ctx = ctx;

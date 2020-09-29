@@ -41,11 +41,14 @@
 #include "../common/ttyio.h"
 #include "../common/server-help.h"
 #include "../common/openpgpdefs.h"
+#include "../common/tlv.h"
 
 #include "gpg-card.h"
 
 
 #define CONTROL_D ('D' - 'A' + 1)
+
+#define HISTORYNAME ".gpg-card_history"
 
 /* Constants to identify the commands and options. */
 enum opt_values
@@ -72,6 +75,8 @@ enum opt_values
     oLCmessages,
 
     oNoKeyLookup,
+    oNoHistory,
+    oChUid,
 
     oDummy
   };
@@ -98,6 +103,9 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_s (oLCmessages, "lc-messages","@"),
   ARGPARSE_s_n (oNoKeyLookup,"no-key-lookup",
                 "use --no-key-lookup for \"list\""),
+  ARGPARSE_s_n (oNoHistory,"no-history",
+                "do not use the command history file"),
+  ARGPARSE_s_s (oChUid,      "chuid",      "@"),
 
   ARGPARSE_end ()
 };
@@ -119,6 +127,8 @@ struct keyinfolabel_s
 };
 typedef struct keyinfolabel_s *keyinfolabel_t;
 
+/* Helper for --chuid.  */
+static const char *changeuser;
 
 /* Limit of size of data we read from a file for certain commands.  */
 #define MAX_GET_DATA_FROM_FILE 16384
@@ -227,6 +237,9 @@ parse_arguments (gpgrt_argparse_t *pargs, gpgrt_opt_t *popts)
         case oLCmessages:  opt.lc_messages = pargs->r.ret_str; break;
 
         case oNoKeyLookup: opt.no_key_lookup = 1; break;
+        case oNoHistory:   opt.no_history = 1; break;
+
+        case oChUid:       changeuser = pargs->r.ret_str; break;
 
         default: pargs->err = 2; break;
 	}
@@ -272,6 +285,9 @@ main (int argc, char **argv)
   parse_arguments (&pargs, opts);
   gpgrt_argparse (NULL, &pargs, NULL);  /* Release internal state.  */
 
+  if (changeuser && gnupg_chuid (changeuser, 0))
+    log_inc_errorcount (); /* Force later termination.  */
+
   if (log_get_errorcount (0))
     exit (2);
 
@@ -313,6 +329,9 @@ main (int argc, char **argv)
         }
     }
   opt.interactive = !cmdidx;
+
+  if (!opt.interactive)
+    opt.no_history = 1;
 
   if (opt.interactive)
     {
@@ -405,6 +424,34 @@ get_data_from_file (const char *fname, char **r_buffer, size_t *r_buflen)
   if (r_buflen)
     *r_buflen = n;
   return 0;
+}
+
+
+/* Fixup the ENODEV error from scdaemon which we may see after
+ * removing a card due to scdaemon scanning for readers with cards.
+ * We also map the CAERD REMOVED error to the more useful CARD_NOT
+ * PRESENT.  */
+static gpg_error_t
+fixup_scd_errors (gpg_error_t err)
+{
+  if ((gpg_err_code (err) == GPG_ERR_ENODEV
+       || gpg_err_code (err) == GPG_ERR_CARD_REMOVED)
+      && gpg_err_source (err) == GPG_ERR_SOURCE_SCD)
+    err = gpg_error (GPG_ERR_CARD_NOT_PRESENT);
+  return err;
+}
+
+
+/* Set the card removed flag from INFO depending on ERR.  This does
+ * not clear the flag.  */
+static gpg_error_t
+maybe_set_card_removed (card_info_t info, gpg_error_t err)
+{
+  if ((gpg_err_code (err) == GPG_ERR_ENODEV
+       || gpg_err_code (err) == GPG_ERR_CARD_REMOVED)
+      && gpg_err_source (err) == GPG_ERR_SOURCE_SCD)
+    info->card_removed = 1;
+  return err;
 }
 
 
@@ -600,10 +647,11 @@ mem_is_zero (const char *mem, unsigned int memlen)
 /* Helper to list a single keyref.  LABEL_KEYREF is a fallback key
  * reference if no info is available; it may be NULL.  */
 static void
-list_one_kinfo (key_info_t firstkinfo, key_info_t kinfo,
+list_one_kinfo (card_info_t info, key_info_t kinfo,
                 const char *label_keyref, estream_t fp, int no_key_lookup)
 {
   gpg_error_t err;
+  key_info_t firstkinfo = info->kinfo;
   keyblock_t keyblock = NULL;
   keyblock_t kb;
   pubkey_t pubkey;
@@ -642,7 +690,7 @@ list_one_kinfo (key_info_t firstkinfo, key_info_t kinfo,
         }
       tty_fprintf (fp, "\n");
 
-      if (!scd_readkey (kinfo->keyref, &s_pkey))
+      if (!(err = scd_readkey (kinfo->keyref, &s_pkey)))
         {
           char *tmp = pubkey_algo_string (s_pkey, NULL);
           tty_fprintf (fp, "      algorithm ..: %s\n", tmp);
@@ -652,6 +700,7 @@ list_one_kinfo (key_info_t firstkinfo, key_info_t kinfo,
         }
       else
         {
+          maybe_set_card_removed (info, err);
           tty_fprintf (fp, "      algorithm ..: %s\n", kinfo->keyalgo);
         }
 
@@ -750,7 +799,7 @@ list_all_kinfo (card_info_t info, keyinfolabel_t labels, estream_t fp,
                 int no_key_lookup)
 {
   key_info_t kinfo;
-  int idx, i;
+  int idx, i, j;
 
   /* Print the keyinfo.  We first print those we known and then all
    * remaining item.  */
@@ -762,7 +811,7 @@ list_all_kinfo (card_info_t info, keyinfolabel_t labels, estream_t fp,
         {
           tty_fprintf (fp, "%s", labels[idx].label);
           kinfo = find_kinfo (info, labels[idx].keyref);
-          list_one_kinfo (info->kinfo, kinfo, labels[idx].keyref,
+          list_one_kinfo (info, kinfo, labels[idx].keyref,
                           fp, no_key_lookup);
           if (kinfo)
             kinfo->xflag = 1;
@@ -772,11 +821,11 @@ list_all_kinfo (card_info_t info, keyinfolabel_t labels, estream_t fp,
     {
       if (kinfo->xflag)
         continue;
-      tty_fprintf (fp, "Key %s ", kinfo->keyref);
-      for (i=5+strlen (kinfo->keyref); i < 18; i++)
-        tty_fprintf (fp, ".");
+      tty_fprintf (fp, "Key %s", kinfo->keyref);
+      for (i=4+strlen (kinfo->keyref), j=0; i < 18; i++, j=1)
+        tty_fprintf (fp, j? ".":" ");
       tty_fprintf (fp, ":");
-      list_one_kinfo (info->kinfo, kinfo, NULL, fp, no_key_lookup);
+      list_one_kinfo (info, kinfo, NULL, fp, no_key_lookup);
     }
 }
 
@@ -839,6 +888,18 @@ list_openpgp (card_info_t info, estream_t fp, int no_key_lookup)
   tty_fprintf (fp, "PIN retry counter : %d %d %d\n",
                info->chvinfo[0], info->chvinfo[1], info->chvinfo[2]);
   tty_fprintf (fp, "Signature counter : %lu\n", info->sig_counter);
+  tty_fprintf (fp, "Capabilities .....:");
+  if (info->extcap.ki)
+    tty_fprintf (fp, " key-import");
+  if (info->extcap.aac)
+    tty_fprintf (fp, " algo-change");
+  if (info->extcap.bt)
+    tty_fprintf (fp, " button");
+  if (info->extcap.sm)
+    tty_fprintf (fp, " sm(%s)", gcry_cipher_algo_name (info->extcap.smalgo));
+  if (info->extcap.private_dos)
+    tty_fprintf (fp, " priv-data");
+  tty_fprintf (fp, "\n");
   if (info->extcap.kdf)
     {
       tty_fprintf (fp, "KDF setting ......: %s\n",
@@ -847,8 +908,9 @@ list_openpgp (card_info_t info, estream_t fp, int no_key_lookup)
   if (info->extcap.bt)
     {
       tty_fprintf (fp, "UIF setting ......: Sign=%s Decrypt=%s Auth=%s\n",
-                   info->uif[0] ? "on" : "off", info->uif[1] ? "on" : "off",
-                   info->uif[2] ? "on" : "off");
+                   info->uif[0] ? (info->uif[0]==2? "permanent": "on") : "off",
+                   info->uif[1] ? (info->uif[0]==2? "permanent": "on") : "off",
+                   info->uif[2] ? (info->uif[0]==2? "permanent": "on") : "off");
     }
 
   list_all_kinfo (info, keyinfolabels, fp, no_key_lookup);
@@ -916,6 +978,41 @@ list_piv (card_info_t info, estream_t fp, int no_key_lookup)
 
 
 
+/* List Netkey card specific data.  */
+static void
+list_nks (card_info_t info, estream_t fp, int no_key_lookup)
+{
+  static struct keyinfolabel_s keyinfolabels[] = {
+    { NULL, NULL }
+  };
+  const char *s;
+  int i;
+
+  tty_fprintf (fp, "PIN retry counter :");
+  for (i=0; i < DIM (info->chvinfo); i++)
+    {
+      if (info->chvinfo[i] >= 0)
+        tty_fprintf (fp, " %d", info->chvinfo[i]);
+      else
+        {
+          switch (info->chvinfo[i])
+            {
+            case -1: s = "[error]"; break;
+            case -2: s = "-"; break;  /* No such PIN or info not available. */
+            case -3: s = "[blocked]"; break;
+            case -4: s = "[nullpin]"; break;
+            case -5: s = "[verified]"; break;
+            default: s = "[?]"; break;
+            }
+          tty_fprintf (fp, " %s", s);
+        }
+    }
+  tty_fprintf (fp, "\n");
+  list_all_kinfo (info, keyinfolabels, fp, no_key_lookup);
+}
+
+
+
 static void
 print_a_version (estream_t fp, const char *prefix, unsigned int value)
 {
@@ -929,8 +1026,10 @@ print_a_version (estream_t fp, const char *prefix, unsigned int value)
     tty_fprintf (fp, "%s %u.%u.%u.%u\n", prefix, a, b, c, d);
   else if (b)
     tty_fprintf (fp, "%s %u.%u.%u\n", prefix, b, c, d);
-  else
+  else if (c)
     tty_fprintf (fp, "%s %u.%u\n", prefix, c, d);
+  else
+    tty_fprintf (fp, "%s %u\n", prefix, d);
 }
 
 
@@ -974,6 +1073,7 @@ list_card (card_info_t info, int no_key_lookup)
     {
     case APP_TYPE_OPENPGP: list_openpgp (info, fp, no_key_lookup); break;
     case APP_TYPE_PIV:     list_piv (info, fp, no_key_lookup); break;
+    case APP_TYPE_NKS:     list_nks (info, fp, no_key_lookup); break;
     default: break;
     }
 }
@@ -1090,13 +1190,15 @@ cmd_list (card_info_t info, char *argstr)
       goto leave;
     }
 
-  if (!info->serialno)
+  if (!info->serialno || info->need_sn_cmd)
     {
-      /* This is probably the first call.  We need to send a SERIALNO
-       * command to scd so that our session knows all cards.  */
+      /* This is probably the first call or was explictly requested.
+       * We need to send a SERIALNO command to scdaemon so that our
+       * session knows all cards.  */
       err = scd_serialno (NULL, NULL);
       if (err)
         goto leave;
+      info->need_sn_cmd = 0;
       need_learn = 1;
     }
 
@@ -1152,7 +1254,7 @@ cmd_list (card_info_t info, char *argstr)
           err = scd_switchcard (sl->d);
           need_learn = 1;
         }
-      else /* --info with not args - show app list.  */
+      else /* show app list.  */
         {
           err = scd_applist (&cards, 1);
           if (err)
@@ -1178,7 +1280,43 @@ cmd_list (card_info_t info, char *argstr)
       else if (opt_info)
         print_card_list (fp, info, cards, 1);
       else
-        list_card (info, opt_no_key_lookup);
+        {
+          size_t snlen;
+          const char *s;
+
+          /* First get the list of active cards and check whether the
+           * current card is still in the list.  If not the card has
+           * been removed.  Note that during the listing the card
+           * remove state might also be detected but only if an access
+           * to the scdaemon is required; it is anyway better to test
+           * that before starting a listing.  */
+          free_strlist (cards);
+          err = scd_cardlist (&cards);
+          if (err)
+            goto leave;
+          for (sl = cards; sl; sl = sl->next)
+            {
+              if (info && info->serialno)
+                {
+                  s = strchr (sl->d, ' ');
+                  if (s)
+                    snlen = s - sl->d;
+                  else
+                    snlen = strlen (sl->d);
+                  if (strlen (info->serialno) == snlen
+                      && !memcmp (info->serialno, sl->d, snlen))
+                    break;
+                }
+            }
+          if (!sl)
+            {
+              info->need_sn_cmd = 1;
+              err = gpg_error (GPG_ERR_CARD_REMOVED);
+              goto leave;
+            }
+
+          list_card (info, opt_no_key_lookup);
+        }
     }
 
  leave:
@@ -1794,20 +1932,27 @@ cmd_writecert (card_info_t info, char *argstr)
 {
   gpg_error_t err;
   int opt_clear;
+  int opt_openpgp;
   char *certref_buffer = NULL;
   char *certref;
   char *data = NULL;
   size_t datalen;
+  estream_t key = NULL;
+
 
   if (!info)
     return print_help
-      ("WRITECERT [--clear] CERTREF < FILE\n\n"
-       "Write a certificate for key 3.  Unless --clear is given\n"
-       "the file argument is mandatory.  The option --clear removes\n"
-       "the certificate from the card.",
+      ("WRITECERT CERTREF '<' FILE\n"
+       "WRITECERT --openpgp CERTREF ['<' FILE|FPR]\n"
+       "WRITECERT --clear CERTREF\n\n"
+       "Write a certificate for key 3. The option --clear removes\n"
+       "the certificate from the card.  The option --openpgp expects\n"
+       "a keyblock and stores it encapsulated in a CMS container; the\n"
+       "keyblock is taken from FILE or directly from the key with FPR",
        APP_TYPE_OPENPGP, APP_TYPE_PIV, 0);
 
   opt_clear = has_leading_option (argstr, "--clear");
+  opt_openpgp = has_leading_option (argstr, "--openpgp");
   argstr = skip_options (argstr);
 
   certref = argstr;
@@ -1868,15 +2013,58 @@ cmd_writecert (card_info_t info, char *argstr)
             goto leave;
         }
     }
+  else if (opt_openpgp && *argstr)
+    {
+      err = get_minimal_openpgp_key (&key, argstr);
+      if (err)
+        goto leave;
+      if (es_fclose_snatch (key, (void*)&data, &datalen))
+        {
+          err = gpg_error_from_syserror ();
+          goto leave;
+        }
+      key = NULL;
+    }
   else
     {
       err = gpg_error (GPG_ERR_INV_ARG);
       goto leave;
     }
 
+  if (opt_openpgp && !opt_clear)
+    {
+      tlv_builder_t tb;
+      void *tmpder;
+      size_t tmpderlen;
+
+      tb = tlv_builder_new (0);
+      if (!tb)
+        {
+          err = gpg_error_from_syserror ();
+          goto leave;
+        }
+
+      tlv_builder_add_tag (tb, 0, TAG_SEQUENCE);
+      tlv_builder_add_ptr (tb, 0, TAG_OBJECT_ID,
+                           "\x2B\x06\x01\x04\x01\xDA\x47\x02\x03\x01", 10);
+      tlv_builder_add_tag (tb, CLASS_CONTEXT, 0);
+      tlv_builder_add_ptr (tb, 0, TAG_OCTET_STRING, data, datalen);
+      tlv_builder_add_end (tb);
+      tlv_builder_add_end (tb);
+
+      err = tlv_builder_finalize (tb, &tmpder, &tmpderlen);
+      if (err)
+        goto leave;
+      xfree (data);
+      data = tmpder;
+      datalen = tmpderlen;
+    }
+
+
   err = scd_writecert (certref, data, datalen);
 
  leave:
+  es_fclose (key);
   xfree (data);
   xfree (certref_buffer);
   return err;
@@ -1890,15 +2078,19 @@ cmd_readcert (card_info_t info, char *argstr)
   char *certref_buffer = NULL;
   char *certref;
   void *data = NULL;
-  size_t datalen;
+  size_t datalen, dataoff;
   const char *fname;
+  int opt_openpgp;
 
   if (!info)
     return print_help
-      ("READCERT CERTREF > FILE\n\n"
-       "Read the certificate for key CERTREF and store it in FILE.",
+      ("READCERT [--openpgp] CERTREF > FILE\n\n"
+       "Read the certificate for key CERTREF and store it in FILE.\n"
+       "With option \"--openpgp\" an OpenPGP keyblock is expected\n"
+       "and stored in FILE.\n",
        APP_TYPE_OPENPGP, APP_TYPE_PIV, 0);
 
+  opt_openpgp = has_leading_option (argstr, "--openpgp");
   argstr = skip_options (argstr);
 
   certref = argstr;
@@ -1934,11 +2126,56 @@ cmd_readcert (card_info_t info, char *argstr)
       goto leave;
     }
 
+  dataoff = 0;
   err = scd_readcert (certref, &data, &datalen);
   if (err)
     goto leave;
 
-  err = put_data_to_file (fname, data, datalen);
+  if (opt_openpgp)
+    {
+      /* Check whether DATA contains an OpenPGP keyblock and put only
+       * this into FILE.  If the data is something different, return
+       * an error.  */
+      const unsigned char *p;
+      size_t n, objlen, hdrlen;
+      int class, tag, cons, ndef;
+
+      p = data;
+      n = datalen;
+      if (parse_ber_header (&p,&n,&class,&tag,&cons,&ndef,&objlen,&hdrlen))
+        goto not_openpgp;
+      if (!(class == CLASS_UNIVERSAL && tag == TAG_SEQUENCE && cons))
+        goto not_openpgp; /* Does not start with a sequence.  */
+      if (parse_ber_header (&p,&n,&class,&tag,&cons,&ndef,&objlen,&hdrlen))
+        goto not_openpgp;
+      if (!(class == CLASS_UNIVERSAL && tag == TAG_OBJECT_ID && !cons))
+        goto not_openpgp; /* No Object ID.  */
+      if (objlen > n)
+        goto not_openpgp; /* Inconsistent lengths.  */
+      if (objlen != 10
+          || memcmp (p, "\x2B\x06\x01\x04\x01\xDA\x47\x02\x03\x01", objlen))
+        goto not_openpgp; /* Wrong Object ID.  */
+      p += objlen;
+      n -= objlen;
+      if (parse_ber_header (&p,&n,&class,&tag,&cons,&ndef,&objlen,&hdrlen))
+        goto not_openpgp;
+      if (!(class == CLASS_CONTEXT && tag == 0 && cons))
+        goto not_openpgp; /* Not a [0] context tag.  */
+      if (parse_ber_header (&p,&n,&class,&tag,&cons,&ndef,&objlen,&hdrlen))
+        goto not_openpgp;
+      if (!(class == CLASS_UNIVERSAL && tag == TAG_OCTET_STRING && !cons))
+        goto not_openpgp; /* Not an octet string.  */
+      if (objlen > n)
+        goto not_openpgp; /* Inconsistent lengths.  */
+      dataoff = p - (const unsigned char*)data;
+      datalen = objlen;
+    }
+
+  err = put_data_to_file (fname, (unsigned char*)data+dataoff, datalen);
+  goto leave;
+
+ not_openpgp:
+  err = gpg_error (GPG_ERR_WRONG_BLOB_TYPE);
 
  leave:
   xfree (data);
@@ -1952,11 +2189,11 @@ cmd_writekey (card_info_t info, char *argstr)
 {
   gpg_error_t err;
   int opt_force;
-  char *argv[2];
+  const char *argv[2];
   int argc;
   char *keyref_buffer = NULL;
-  char *keyref;
-  char *keygrip;
+  const char *keyref;
+  const char *keygrip;
 
   if (!info)
     return print_help
@@ -2334,6 +2571,7 @@ cmd_generate (card_info_t info, char *argstr)
                     log_printf (" %s%s",
                                 valid_algos[i], valid_algos[i+1]?",":".");
                 }
+              log_printf ("\n");
               show_keysize_warning ();
               goto leave;
             }
@@ -2383,6 +2621,13 @@ cmd_generate (card_info_t info, char *argstr)
   else
     err = generate_key (info, keyref, opt_force, opt_algo? opt_algo[0]:NULL);
 
+  if (!err)
+    {
+      err = scd_learn (info);
+      if (err)
+        log_error ("Error re-reading card: %s\n", gpg_strerror (err));
+    }
+
  leave:
   xfree (opt_algo);
   xfree (keyref_buffer);
@@ -2399,15 +2644,18 @@ cmd_passwd (card_info_t info, char *argstr)
   char *answer = NULL;
   const char *pinref = NULL;
   int reset_mode = 0;
+  int nullpin = 0;
   int menu_used = 0;
 
   if (!info)
     return print_help
-      ("PASSWD [PINREF]\n\n"
+      ("PASSWD [--reset|--nullpin] [PINREF]\n\n"
        "Change or unblock the PINs.  Note that in interactive mode\n"
        "and without a PINREF a menu is presented for certain cards;\n"
        "in non-interactive and without a PINREF a default value is\n"
-       "used for these cards.",
+       "used for these cards.  The option --reset is used with TCOS\n"
+       "cards to reset the PIN using the PUK or vice versa; --nullpin\n"
+       "is used for these cards to set the intial PIN.",
        0);
 
   if (opt.interactive || opt.verbose)
@@ -2415,8 +2663,23 @@ cmd_passwd (card_info_t info, char *argstr)
               app_type_string (info->apptype),
               info->dispserialno? info->dispserialno : info->serialno);
 
-  if (*argstr)
-    pinref = argstr;
+
+  if (has_option (argstr, "--reset"))
+    reset_mode = 1;
+  else if (has_option (argstr, "--nullpin"))
+    nullpin = 1;
+  argstr = skip_options (argstr);
+
+  /* If --reset or --nullpin has been given we force non-interactive mode.  */
+  if (*argstr || reset_mode || nullpin)
+    {
+      pinref = argstr;
+      if (!*pinref)
+        {
+          err = gpg_error (GPG_ERR_MISSING_VALUE);
+          goto leave;
+        }
+    }
   else if (opt.interactive && info->apptype == APP_TYPE_OPENPGP)
     {
       menu_used = 1;
@@ -2466,6 +2729,83 @@ cmd_passwd (card_info_t info, char *argstr)
             pinref = "PIV.00";
         }
     }
+  else if (opt.interactive && info->apptype == APP_TYPE_NKS)
+    {
+      int for_qualified = 0;
+
+      menu_used = 1;
+
+      for (;;)
+        {
+          xfree (answer);
+          answer = get_selection (" 1 - Standard PIN/PUK\n"
+                                  " 2 - PIN/PUK for qualified signature\n"
+                                  " Q - quit\n");
+          if (!ascii_strcasecmp (answer, "q"))
+            goto leave;
+          else if (!strcmp (answer, "1"))
+            break;
+          else if (!strcmp (answer, "2"))
+            {
+              for_qualified = 1;
+              break;
+            }
+        }
+
+      log_assert (DIM (info->chvinfo) >= 4);
+      if (info->chvinfo[for_qualified? 2 : 0] == -4)
+        {
+          while (!pinref)
+            {
+              xfree (answer);
+              answer = get_selection
+                ("The NullPIN is still active on this card.\n"
+                 "You need to choose and set a PIN first.\n"
+                 "\n"
+                 " 1 - Set your PIN\n"
+                 " Q - quit\n");
+              if (!ascii_strcasecmp (answer, "q"))
+                goto leave;
+              else if (!strcmp (answer, "1"))
+                {
+                  pinref = for_qualified? "PW1.CH.SIG" : "PW1.CH";
+                  nullpin = 1;
+                }
+            }
+        }
+      else
+        {
+          while (!pinref)
+            {
+              xfree (answer);
+              answer = get_selection (" 1 - change PIN\n"
+                                      " 2 - reset PIN\n"
+                                      " 3 - change PUK\n"
+                                      " 4 - reset PUK\n"
+                                      " Q - quit\n");
+              if (!ascii_strcasecmp (answer, "q"))
+                goto leave;
+              else if (!strcmp (answer, "1"))
+                {
+                  pinref = for_qualified? "PW1.CH.SIG" : "PW1.CH";
+                }
+              else if (!strcmp (answer, "2"))
+                {
+                  pinref = for_qualified? "PW1.CH.SIG" : "PW1.CH";
+                  reset_mode = 1;
+                }
+              else if (!strcmp (answer, "3"))
+                {
+                  pinref = for_qualified? "PW2.CH.SIG" : "PW2.CH";
+                }
+              else if (!strcmp (answer, "4"))
+                {
+                  pinref = for_qualified? "PW2.CH.SIG" : "PW2.CH";
+                  reset_mode = 1;
+                }
+            }
+        }
+    }
   else if (info->apptype == APP_TYPE_PIV)
     pinref = "PIV.80";
   else
@@ -2474,7 +2814,7 @@ cmd_passwd (card_info_t info, char *argstr)
       goto leave;
     }
 
-  err = scd_change_pin (pinref, reset_mode);
+  err = scd_change_pin (pinref, reset_mode, nullpin);
   if (err)
     {
       if (!opt.interactive && !menu_used && !opt.verbose)
@@ -2487,6 +2827,8 @@ cmd_passwd (card_info_t info, char *argstr)
         log_error ("Error setting the Reset Code.\n");
       else if (!ascii_strcasecmp (pinref, "OPENPGP.3"))
         log_error ("Error changing the Admin PIN.\n");
+      else if (reset_mode)
+        log_error ("Error resetting the PIN.\n");
       else
         log_error ("Error changing the PIN.\n");
     }
@@ -2502,8 +2844,13 @@ cmd_passwd (card_info_t info, char *argstr)
         log_info ("Reset Code set.\n");
       else if (!ascii_strcasecmp (pinref, "OPENPGP.3"))
         log_info ("Admin PIN changed.\n");
+      else if (reset_mode)
+        log_info ("PIN resetted.\n");
       else
         log_info ("PIN changed.\n");
+
+      /* Update the CHV status.  */
+      err = scd_getattr ("CHV-STATUS", info);
     }
 
  leave:
@@ -2544,7 +2891,7 @@ cmd_unblock (card_info_t info)
         }
       else
         {
-          err = scd_change_pin ("OPENPGP.2", 0);
+          err = scd_change_pin ("OPENPGP.2", 0, 0);
           if (!err)
             log_info ("PIN changed.\n");
         }
@@ -2552,7 +2899,7 @@ cmd_unblock (card_info_t info)
   else if (info->apptype == APP_TYPE_PIV)
     {
       /* Unblock the Application PIN.  */
-      err = scd_change_pin ("PIV.80", 1);
+      err = scd_change_pin ("PIV.80", 1, 0);
       if (!err)
         log_info ("PIN unblocked and changed.\n");
     }
@@ -2756,6 +3103,8 @@ cmd_factoryreset (card_info_t info)
 
   /* Then, connect the card again.  */
   err = scd_serialno (NULL, NULL);
+  if (!err)
+    info->need_sn_cmd = 0;
 
  leave:
   if (err && any_apdu && !is_yubikey)
@@ -2918,6 +3267,10 @@ cmd_uif (card_info_t info, char *argstr)
 {
   gpg_error_t err;
   int keyno;
+  char name[50];
+  unsigned char data[2];
+  char *answer = NULL;
+  int opt_yes;
 
   if (!info)
     return print_help
@@ -2925,6 +3278,14 @@ cmd_uif (card_info_t info, char *argstr)
        "Change the User Interaction Flag.  N must in the range 1 to 3.",
        APP_TYPE_OPENPGP, APP_TYPE_PIV, 0);
 
+  if (!info->extcap.bt)
+    {
+      log_error (_("This command is not supported by this card\n"));
+      err = gpg_error (GPG_ERR_NOT_SUPPORTED);
+      goto leave;
+    }
+
+  opt_yes = has_leading_option (argstr, "--yes");
   argstr = skip_options (argstr);
 
   if (digitp (argstr))
@@ -2944,10 +3305,68 @@ cmd_uif (card_info_t info, char *argstr)
       goto leave;
     }
 
+  if ( !strcmp (argstr, "off") )
+    data[0] = 0x00;
+  else if ( !strcmp (argstr, "on") )
+    data[0] = 0x01;
+  else if ( !strcmp (argstr, "permanent") )
+    data[0] = 0x02;
+  else
+    {
+      err = gpg_error (GPG_ERR_INV_ARG);
+      goto leave;
+    }
+  data[1] = 0x20;
 
-  err = GPG_ERR_NOT_IMPLEMENTED;
+
+  log_assert (keyno - 1 < DIM(info->uif));
+  if (info->uif[keyno-1] == 2)
+    {
+      log_info (_("User Interaction Flag is set to \"%s\" - can't change\n"),
+                "permanent");
+      err = gpg_error (GPG_ERR_INV_STATE);
+      goto leave;
+    }
+
+  if (data[0] == 0x02)
+    {
+      if (opt.interactive)
+        {
+          tty_printf (_("Warning: Setting the User Interaction Flag to \"%s\"\n"
+                        "         can only be reverted using a factory reset!\n"
+                        ), "permanent");
+          answer = tty_get (_("Continue? (y/N) "));
+          tty_kill_prompt ();
+          if (*answer == CONTROL_D)
+            err = gpg_error (GPG_ERR_CANCELED);
+          else if (!answer_is_yes_no_default (answer, 0/*(default to No)*/))
+            err = gpg_error (GPG_ERR_CANCELED);
+          else
+            err = 0;
+        }
+      else if (!opt_yes)
+        {
+          log_info (_("Warning: Setting the User Interaction Flag to \"%s\"\n"
+                      "         can only be reverted using a factory reset!\n"
+                      ), "permanent");
+          log_info (_("Please use \"uif --yes %d %s\"\n"),
+                    keyno, "permanent");
+          err = gpg_error (GPG_ERR_CANCELED);
+        }
+      else
+        err = 0;
+
+      if (err)
+        goto leave;
+    }
+
+  snprintf (name, sizeof name, "UIF-%d", keyno);
+  err = scd_setattr (name, data, 2);
+  if (!err) /* Read all UIF attributes again.  */
+    err = scd_getattr ("UIF", info);
 
  leave:
+  xfree (answer);
   return err;
 }
 
@@ -2957,7 +3376,7 @@ cmd_yubikey (card_info_t info, char *argstr)
 {
   gpg_error_t err, err2;
   estream_t fp = opt.interactive? NULL : es_stdout;
-  char *words[20];
+  const char *words[20];
   int nwords;
 
   if (!info)
@@ -3004,6 +3423,128 @@ cmd_yubikey (card_info_t info, char *argstr)
   return err;
 }
 
+
+static gpg_error_t
+cmd_apdu (card_info_t info, char *argstr)
+{
+  gpg_error_t err;
+  estream_t fp = opt.interactive? NULL : es_stdout;
+  int with_atr;
+  int handle_more;
+  const char *s;
+  const char  *exlenstr;
+  int exlenstrlen;
+  char *options = NULL;
+  unsigned int sw;
+  unsigned char *result = NULL;
+  size_t i, j, resultlen;
+
+  if (!info)
+    return print_help
+      ("APDU [--more] [--exlen[=N]] <hexstring>\n"
+       "\n"
+       "Send an APDU to the current card.  This command bypasses the high\n"
+       "level functions and sends the data directly to the card.  HEXSTRING\n"
+       "is expected to be a proper APDU.\n"
+       "\n"
+       "Using the option \"--more\" handles the card status word MORE_DATA\n"
+       "(61xx) and concatenates all responses to one block.\n"
+       "\n"
+       "Using the option \"--exlen\" the returned APDU may use extended\n"
+       "length up to N bytes.  If N is not given a default value is used.\n",
+       0);
+
+  if (has_option (argstr, "--dump-atr"))
+    with_atr = 2;
+  else
+    with_atr = has_option (argstr, "--atr");
+  handle_more = has_option (argstr, "--more");
+
+  exlenstr = has_option_name (argstr, "--exlen");
+  exlenstrlen = 0;
+  if (exlenstr)
+    {
+      for (s=exlenstr; *s && !spacep (s); s++)
+        exlenstrlen++;
+    }
+
+  argstr = skip_options (argstr);
+
+  if (with_atr || handle_more || exlenstr)
+    options = xasprintf ("%s%s%s%.*s",
+                         with_atr == 2? " --dump-atr":
+                         with_atr? " --data-atr":"",
+                         handle_more?" --more":"",
+                         exlenstr?" --exlen=":"",
+                         exlenstrlen, exlenstr?exlenstr:"");
+
+  err = scd_apdu (argstr, options, &sw, &result, &resultlen);
+  if (err)
+    goto leave;
+  if (!with_atr)
+    log_info ("Statusword: 0x%04x\n", sw);
+  for (i=0; i < resultlen; )
+    {
+      size_t save_i = i;
+
+      tty_fprintf (fp, "D[%04X] ", (unsigned int)i);
+      for (j=0; j < 16 ; j++, i++)
+        {
+          if (j == 8)
+            tty_fprintf (fp, " ");
+          if (i < resultlen)
+            tty_fprintf (fp, " %02X", result[i]);
+          else
+            tty_fprintf (fp, "   ");
+        }
+      tty_fprintf (fp, "   ");
+      i = save_i;
+      for (j=0; j < 16; j++, i++)
+        {
+          unsigned int c = result[i];
+          if ( i >= resultlen )
+            tty_fprintf (fp, " ");
+          else if (isascii (c) && isprint (c) && !iscntrl (c))
+            tty_fprintf (fp, "%c", c);
+          else
+            tty_fprintf (fp, ".");
+        }
+      tty_fprintf (fp, "\n");
+    }
+
+ leave:
+  xfree (result);
+  xfree (options);
+  return err;
+}
+
+
+static gpg_error_t
+cmd_history (card_info_t info, char *argstr)
+{
+  int opt_list, opt_clear;
+
+  opt_list  = has_option (argstr, "--list");
+  opt_clear = has_option (argstr, "--clear");
+
+  if (!info || !(opt_list || opt_clear))
+    return print_help
+      ("HISTORY --list\n"
+       "   List the command history\n"
+       "HISTORY --clear\n"
+       "   Clear the command history",
+       0);
+
+  if (opt_list)
+    tty_printf ("Sorry, history listing not yet possible\n");
+
+  if (opt_clear)
+    tty_read_history (NULL, 0);
+
+  return 0;
+}
+
+
 
 
 /* Data used by the command parser.  This needs to be outside of the
@@ -3015,7 +3556,7 @@ enum cmdids
     cmdNAME, cmdURL, cmdFETCH, cmdLOGIN, cmdLANG, cmdSALUT, cmdCAFPR,
     cmdFORCESIG, cmdGENERATE, cmdPASSWD, cmdPRIVATEDO, cmdWRITECERT,
     cmdREADCERT, cmdWRITEKEY,  cmdUNBLOCK, cmdFACTRST, cmdKDFSETUP,
-    cmdUIF, cmdAUTH, cmdYUBIKEY,
+    cmdUIF, cmdAUTH, cmdYUBIKEY, cmdAPDU, cmdHISTORY,
     cmdINVCMD
   };
 
@@ -3027,6 +3568,7 @@ static struct
 } cmds[] = {
   { "quit"    ,  cmdQUIT,       N_("quit this menu")},
   { "q"       ,  cmdQUIT,       NULL },
+  { "bye"     ,  cmdQUIT,       NULL },
   { "help"    ,  cmdHELP,       N_("show this help")},
   { "?"       ,  cmdHELP,       NULL },
   { "list"    ,  cmdLIST,       N_("list all available data")},
@@ -3055,6 +3597,8 @@ static struct
   { "writecert", cmdWRITECERT,  N_("store a certificate to a data object")},
   { "writekey",  cmdWRITEKEY,   N_("store a private key to a data object")},
   { "yubikey",   cmdYUBIKEY,    N_("Yubikey management commands")},
+  { "apdu",      cmdAPDU,       NULL},
+  { "history",   cmdHISTORY,    N_("manage the command history")},
   { NULL, cmdINVCMD, NULL }
 };
 
@@ -3101,10 +3645,14 @@ dispatch_command (card_info_t info, const char *orig_command)
       err = scd_learn (info);
       if (err)
         {
+          err = fixup_scd_errors (err);
           log_error ("Error reading card: %s\n", gpg_strerror (err));
           goto leave;
         }
     }
+
+  if (info)
+    info->card_removed = 0;
 
   switch (cmd)
     {
@@ -3150,7 +3698,9 @@ dispatch_command (card_info_t info, const char *orig_command)
       else
         {
           flush_keyblock_cache ();
-          err = scd_apdu (NULL, NULL, NULL, NULL);
+          err = scd_apdu (NULL, NULL, NULL, NULL, NULL);
+          if (!err)
+            info->need_sn_cmd = 1;
         }
       break;
 
@@ -3176,6 +3726,8 @@ dispatch_command (card_info_t info, const char *orig_command)
     case cmdKDFSETUP:     err = cmd_kdfsetup (info, argstr); break;
     case cmdUIF:          err = cmd_uif (info, argstr); break;
     case cmdYUBIKEY:      err = cmd_yubikey (info, argstr); break;
+    case cmdAPDU:         err = cmd_apdu (info, argstr); break;
+    case cmdHISTORY:      err = 0; break; /* Only used in interactive mode.  */
 
     case cmdINVCMD:
     default:
@@ -3189,15 +3741,28 @@ dispatch_command (card_info_t info, const char *orig_command)
   es_fflush (es_stdout);
   if (gpg_err_code (err) == GPG_ERR_EOF && cmd != cmdQUIT)
     err = gpg_error (GPG_ERR_GENERAL);
+
+  if (!err && info && info->card_removed)
+    {
+      info->card_removed = 0;
+      info->need_sn_cmd = 1;
+      err = gpg_error (GPG_ERR_CARD_REMOVED);
+    }
+
   if (err && gpg_err_code (err) != GPG_ERR_EOF)
     {
+      err = fixup_scd_errors (err);
       if (ignore_error)
         {
           log_info ("Command '%s' failed: %s\n", command, gpg_strerror (err));
           err = 0;
         }
       else
-        log_error ("Command '%s' failed: %s\n", command, gpg_strerror (err));
+        {
+          log_error ("Command '%s' failed: %s\n", command, gpg_strerror (err));
+          if (gpg_err_code (err) == GPG_ERR_CARD_NOT_PRESENT)
+            info->need_sn_cmd = 1;
+        }
     }
   xfree (command);
 
@@ -3219,9 +3784,18 @@ interactive_loop (void)
   card_info_t info = &info_buffer;
   char *p;
   int i;
+  char *historyname = NULL;
 
   /* In the interactive mode we do not want to print the program prefix.  */
   log_set_prefix (NULL, 0);
+
+  if (!opt.no_history)
+    {
+      historyname = make_filename (gnupg_homedir (), HISTORYNAME, NULL);
+      if (tty_read_history (historyname, 500))
+        log_info ("error reading '%s': %s\n",
+                  historyname, gpg_strerror (gpg_error_from_syserror ()));
+    }
 
   for (;;)
     {
@@ -3241,7 +3815,10 @@ interactive_loop (void)
         {
           err = cmd_list (info, "");
           if (err)
-            log_error ("Error reading card: %s\n", gpg_strerror (err));
+            {
+              err = fixup_scd_errors (err);
+              log_error ("Error reading card: %s\n", gpg_strerror (err));
+            }
           else
             {
               tty_printf("\n");
@@ -3299,7 +3876,7 @@ interactive_loop (void)
         argstr = answer + strlen (answer);
 
       if (!(cmd == cmdNOP || cmd == cmdQUIT || cmd == cmdHELP
-            || cmd == cmdINVCMD))
+            || cmd == cmdHISTORY || cmd == cmdINVCMD))
         {
           /* If redisplay is set we know that there was an error reading
            * the card.  In this case we force a LIST command to retry.  */
@@ -3313,12 +3890,19 @@ interactive_loop (void)
             {
               /* Without a serial number most commands won't work.
                * Catch it here.  */
-              tty_printf ("\n");
-              tty_printf ("Serial number missing\n");
-              continue;
+              if (cmd == cmdRESET || cmd == cmdLIST)
+                info->need_sn_cmd = 1;
+              else
+                {
+                  tty_printf ("\n");
+                  tty_printf ("Serial number missing\n");
+                  continue;
+                }
             }
         }
 
+      if (info)
+        info->card_removed = 0;
       err = 0;
       switch (cmd)
         {
@@ -3363,7 +3947,9 @@ interactive_loop (void)
           else
             {
               flush_keyblock_cache ();
-              err = scd_apdu (NULL, NULL, NULL, NULL);
+              err = scd_apdu (NULL, NULL, NULL, NULL, NULL);
+              if (!err)
+                info->need_sn_cmd = 1;
             }
           break;
 
@@ -3397,6 +3983,8 @@ interactive_loop (void)
         case cmdKDFSETUP:  err = cmd_kdfsetup (info, argstr); break;
         case cmdUIF:       err = cmd_uif (info, argstr); break;
         case cmdYUBIKEY:   err = cmd_yubikey (info, argstr); break;
+        case cmdAPDU:      err = cmd_apdu (info, argstr); break;
+        case cmdHISTORY:   err = cmd_history (info, argstr); break;
 
         case cmdINVCMD:
         default:
@@ -3404,6 +3992,13 @@ interactive_loop (void)
           tty_printf (_("Invalid command  (try \"help\")\n"));
           break;
         } /* End command switch. */
+
+      if (!err && info && info->card_removed)
+        {
+          info->card_removed = 0;
+          info->need_sn_cmd = 1;
+          err = gpg_error (GPG_ERR_CARD_REMOVED);
+        }
 
       if (gpg_err_code (err) == GPG_ERR_CANCELED)
         tty_fprintf (NULL, "\n");
@@ -3416,13 +4011,22 @@ interactive_loop (void)
                 s = cmds[i].name;
                 break;
               }
+
+          err = fixup_scd_errors (err);
           log_error ("Command '%s' failed: %s\n", s, gpg_strerror (err));
+          if (gpg_err_code (err) == GPG_ERR_CARD_NOT_PRESENT)
+            info->need_sn_cmd = 1;
         }
 
     } /* End of main menu loop. */
 
  leave:
+  if (historyname && tty_write_history (historyname))
+    log_info ("error writing '%s': %s\n",
+              historyname, gpg_strerror (gpg_error_from_syserror ()));
+
   release_card_info (info);
+  xfree (historyname);
   xfree (answer);
 }
 

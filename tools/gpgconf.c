@@ -51,6 +51,7 @@ enum cmd_and_opt_values
     oBuilddir,
     oStatusFD,
     oShowSocket,
+    oChUid,
 
     aListComponents,
     aCheckPrograms,
@@ -67,7 +68,8 @@ enum cmd_and_opt_values
     aCreateSocketDir,
     aRemoveSocketDir,
     aApplyProfile,
-    aReload
+    aReload,
+    aShowCodepages
   };
 
 
@@ -98,6 +100,7 @@ static gpgrt_opt_t opts[] =
     { aKill,          "kill", 256,   N_("kill a given component")},
     { aCreateSocketDir, "create-socketdir", 256, "@"},
     { aRemoveSocketDir, "remove-socketdir", 256, "@"},
+    ARGPARSE_c (aShowCodepages, "show-codepages", "@"),
 
     { 301, NULL, 0, N_("@\nOptions:\n ") },
 
@@ -106,13 +109,15 @@ static gpgrt_opt_t opts[] =
     { oQuiet, "quiet",      0, N_("quiet") },
     { oDryRun, "dry-run",   0, N_("do not make any changes") },
     { oRuntime, "runtime",  0, N_("activate changes at runtime, if possible") },
-  ARGPARSE_s_i (oStatusFD, "status-fd", N_("|FD|write status info to this FD")),
+    ARGPARSE_s_i (oStatusFD, "status-fd",
+                  N_("|FD|write status info to this FD")),
     /* hidden options */
     { oHomedir, "homedir", 2, "@" },
     { oBuilddir, "build-prefix", 2, "@" },
     { oNull, "null", 0, "@" },
     { oNoVerbose, "no-verbose",  0, "@"},
     ARGPARSE_s_n (oShowSocket, "show-socket", "@"),
+    ARGPARSE_s_s (oChUid, "chuid", "@"),
 
     ARGPARSE_end(),
   };
@@ -244,6 +249,7 @@ list_dirs (estream_t fp, char **names)
     { "localedir",          gnupg_localedir,  NULL },
     { "socketdir",          gnupg_socketdir,  NULL },
     { "dirmngr-socket",     dirmngr_socket_name, NULL,},
+    { "keyboxd-socket",     keyboxd_socket_name, NULL,},
     { "agent-ssh-socket",   gnupg_socketdir,  GPG_AGENT_SSH_SOCK_NAME },
     { "agent-extra-socket", gnupg_socketdir,  GPG_AGENT_EXTRA_SOCK_NAME },
     { "agent-browser-socket",gnupg_socketdir, GPG_AGENT_BROWSER_SOCK_NAME },
@@ -356,7 +362,7 @@ query_swdb (estream_t out, const char *name, const char *current_version)
   size_t length_of_line = 0;
   size_t  maxlen;
   ssize_t len;
-  char *fields[2];
+  const char *fields[2];
   char *p;
   gnupg_isotime_t filedate = {0};
   gnupg_isotime_t verified = {0};
@@ -547,6 +553,7 @@ main (int argc, char **argv)
   enum cmd_and_opt_values cmd = 0;
   estream_t outfp = NULL;
   int show_socket = 0;
+  const char *changeuser = NULL;
 
   early_system_init ();
   gnupg_reopen_std (GPGCONF_NAME);
@@ -579,6 +586,7 @@ main (int argc, char **argv)
           set_status_fd (translate_sys2libc_fd_int (pargs.r.ret_int, 1));
           break;
         case oShowSocket: show_socket = 1; break;
+        case oChUid:      changeuser = pargs.r.ret_str; break;
 
 	case aListDirs:
         case aListComponents:
@@ -596,6 +604,7 @@ main (int argc, char **argv)
         case aKill:
         case aCreateSocketDir:
         case aRemoveSocketDir:
+        case aShowCodepages:
 	  cmd = pargs.r_opt;
 	  break;
 
@@ -619,6 +628,10 @@ main (int argc, char **argv)
     }
 
   fname = argc ? *argv : NULL;
+
+  /* If requested switch to the requested user or die.  */
+  if (changeuser && (err = gnupg_chuid (changeuser, 0)))
+    gpgconf_failure (err);
 
   /* Set the configuraton directories for use by gpgrt_argparser.  We
    * don't have a configuration file for this program but we have code
@@ -720,6 +733,8 @@ main (int argc, char **argv)
                     names[0] = "agent-socket";
                   else if (idx == GC_COMPONENT_DIRMNGR)
                     names[0] = "dirmngr-socket";
+                  else if (idx == GC_COMPONENT_KEYBOXD)
+                    names[0] = "keyboxd-socket";
                   else
                     names[0] = NULL;
                   names[1] = NULL;
@@ -879,6 +894,7 @@ main (int argc, char **argv)
                   GPG_AGENT_BROWSER_SOCK_NAME,
                   GPG_AGENT_SSH_SOCK_NAME,
                   SCDAEMON_SOCK_NAME,
+                  KEYBOXD_SOCK_NAME,
                   DIRMNGR_SOCK_NAME
                 };
                 int i;
@@ -906,6 +922,18 @@ main (int argc, char **argv)
         xfree (socketdir);
       }
       break;
+
+    case aShowCodepages:
+#ifdef HAVE_W32_SYSTEM
+      {
+        get_outfp (&outfp);
+        es_fprintf (outfp, "Console: CP%u\n", GetConsoleOutputCP ());
+        es_fprintf (outfp, "ANSI: CP%u\n", GetACP ());
+        es_fprintf (outfp, "OEM: CP%u\n", GetOEMCP ());
+      }
+#endif
+      break;
+
 
     }
 

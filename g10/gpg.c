@@ -437,6 +437,7 @@ enum cmd_and_opt_values
     oFullTimestrings,
     oIncludeKeyBlock,
     oNoIncludeKeyBlock,
+    oChUid,
 
     oNoop
   };
@@ -897,6 +898,7 @@ static gpgrt_opt_t opts[] = {
   ARGPARSE_s_s (oLCctype,    "lc-ctype",   "@"),
   ARGPARSE_s_s (oLCmessages, "lc-messages","@"),
   ARGPARSE_s_s (oXauthority, "xauthority", "@"),
+  ARGPARSE_s_s (oChUid,      "chuid",      "@"),
   ARGPARSE_s_n (oNoAutostart, "no-autostart", "@"),
   ARGPARSE_s_n (oUseKeyboxd,    "use-keyboxd", "@"),
   /* Options which can be used in special circumstances. They are not
@@ -2328,6 +2330,8 @@ main (int argc, char **argv)
     static int print_dane_records;
     static int print_pka_records;
     static int allow_large_chunks;
+    static const char *homedirvalue;
+    static const char *changeuser;
 
 
 #ifdef __riscos__
@@ -2387,11 +2391,15 @@ main (int argc, char **argv)
     opt.max_cert_depth = 5;
     opt.escape_from = 1;
     opt.flags.require_cross_cert = 1;
-    opt.import_options = IMPORT_REPAIR_KEYS;
+    opt.import_options = (IMPORT_REPAIR_KEYS
+                          | IMPORT_COLLAPSE_UIDS
+                          | IMPORT_COLLAPSE_SUBKEYS);
     opt.export_options = EXPORT_ATTRIBUTES;
     opt.keyserver_options.import_options = (IMPORT_REPAIR_KEYS
 					    | IMPORT_REPAIR_PKS_SUBKEY_BUG
                                             | IMPORT_SELF_SIGS_ONLY
+                                            | IMPORT_COLLAPSE_UIDS
+                                            | IMPORT_COLLAPSE_SUBKEYS
                                             | IMPORT_CLEAN);
     opt.keyserver_options.export_options = EXPORT_ATTRIBUTES;
     opt.keyserver_options.options = KEYSERVER_HONOR_PKA_RECORD;
@@ -2413,7 +2421,6 @@ main (int argc, char **argv)
     opt.keyid_format = KF_NONE;
     opt.def_sig_expire = "0";
     opt.def_cert_expire = "0";
-    gnupg_set_homedir (NULL);
     opt.passphrase_repeat = 1;
     opt.emit_version = 0;
     opt.weak_digests = NULL;
@@ -2446,7 +2453,11 @@ main (int argc, char **argv)
             break;
 
           case oHomedir:
-            gnupg_set_homedir (pargs.r.ret_str);
+            homedirvalue = pargs.r.ret_str;
+            break;
+
+          case oChUid:
+            changeuser = pargs.r.ret_str;
             break;
 
           case oNoPermissionWarn:
@@ -2497,6 +2508,11 @@ main (int argc, char **argv)
     assuan_set_malloc_hooks (&malloc_hooks);
     assuan_set_gpg_err_source (GPG_ERR_SOURCE_DEFAULT);
     setup_libassuan_logging (&opt.debug, NULL);
+
+    /* Change UID and then set the homedir.  */
+    if (changeuser && gnupg_chuid (changeuser, 0))
+      log_inc_errorcount (); /* Force later termination.  */
+    gnupg_set_homedir (homedirvalue);
 
     /* Set default options which require that malloc stuff is ready.  */
     additional_weak_digest ("MD5");
@@ -2872,6 +2888,7 @@ main (int argc, char **argv)
             opt.def_recipient_self = 0;
             break;
 	  case oHomedir: break;
+          case oChUid: break;  /* Command line only (see above).  */
 	  case oNoBatch: opt.batch = 0; break;
 
           case oWithTofuInfo: opt.with_tofu_info = 1; break;
@@ -4481,7 +4498,10 @@ main (int argc, char **argv)
       case aDeleteSecretKeys:
       case aDeleteSecretAndPublicKeys:
 	sl = NULL;
-	/* I'm adding these in reverse order as add_to_strlist2
+        /* Print a note if the user did not specify any key.  */
+        if (!argc && !opt.quiet)
+          log_info (_("Note: %s\n"), gpg_strerror (GPG_ERR_NO_KEY));
+        /* I'm adding these in reverse order as add_to_strlist2
            reverses them again, and it's easier to understand in the
            proper order :) */
 	for( ; argc; argc-- )
@@ -4874,42 +4894,55 @@ main (int argc, char **argv)
 
       case aGenRandom:
 	{
-	    int level = argc ? atoi(*argv):0;
-	    int count = argc > 1 ? atoi(argv[1]): 0;
-	    int endless = !count;
+          int level = argc ? atoi(*argv):0;
+          int count = argc > 1 ? atoi(argv[1]): 0;
+          int endless = !count;
+          int hexhack = (level == 16);
 
-	    if( argc < 1 || argc > 2 || level < 0 || level > 2 || count < 0 )
-		wrong_args("--gen-random 0|1|2 [count]");
+          if (hexhack)
+            level = 1;
 
-	    while( endless || count ) {
-		byte *p;
-                /* We need a multiple of 3, so that in case of
-                   armored output we get a correct string.  No
-                   linefolding is done, as it is best to leave this to
-                   other tools */
-		size_t n = !endless && count < 99? count : 99;
+          if (argc < 1 || argc > 2 || level < 0 || level > 2 || count < 0)
+            wrong_args ("--gen-random 0|1|2 [count]");
 
-		p = gcry_random_bytes (n, level);
+          while (endless || count)
+            {
+              byte *p;
+              /* We need a multiple of 3, so that in case of armored
+               * output we get a correct string.  No linefolding is
+               * done, as it is best to leave this to other tools */
+              size_t n = !endless && count < 99? count : 99;
+              size_t nn;
+
+              p = gcry_random_bytes (n, level);
 #ifdef HAVE_DOSISH_SYSTEM
-		setmode ( fileno(stdout), O_BINARY );
+              setmode ( fileno(stdout), O_BINARY );
 #endif
-                if (opt.armor) {
-                    char *tmp = make_radix64_string (p, n);
-                    es_fputs (tmp, es_stdout);
-                    xfree (tmp);
-                    if (n%3 == 1)
-                      es_putc ('=', es_stdout);
-                    if (n%3)
-                      es_putc ('=', es_stdout);
-                } else {
-                    es_fwrite( p, n, 1, es_stdout );
+              if (hexhack)
+                {
+                  for (nn = 0; nn < n; nn++)
+                    es_fprintf (es_stdout, "%02x", p[nn]);
                 }
-		xfree(p);
-		if( !endless )
-		    count -= n;
+              else if (opt.armor)
+                {
+                  char *tmp = make_radix64_string (p, n);
+                  es_fputs (tmp, es_stdout);
+                  xfree (tmp);
+                  if (n%3 == 1)
+                    es_putc ('=', es_stdout);
+                  if (n%3)
+                    es_putc ('=', es_stdout);
+                }
+              else
+                {
+                  es_fwrite( p, n, 1, es_stdout );
+                }
+              xfree(p);
+              if (!endless)
+                count -= n;
 	    }
-            if (opt.armor)
-              es_putc ('\n', es_stdout);
+          if (opt.armor || hexhack)
+            es_putc ('\n', es_stdout);
 	}
 	break;
 

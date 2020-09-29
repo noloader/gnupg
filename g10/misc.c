@@ -71,7 +71,7 @@
 #include "../common/zb32.h"
 
 
-/* FIXME: Libgcrypt 1.9 will support EAX.  Until we kame this a
+/* FIXME: Libgcrypt 1.9 will support EAX.  Until we name this a
  * requirement we hardwire the enum used for EAX.  */
 #define MY_GCRY_CIPHER_MODE_EAX 14
 
@@ -1216,7 +1216,7 @@ string_to_aead_algo (const char *string)
 
   if (!string)
     result = 0;
-  if (!ascii_strcasecmp (string, "EAX"))
+  else if (!ascii_strcasecmp (string, "EAX"))
     result = 1;
   else if (!ascii_strcasecmp (string, "OCB"))
     result = 2;

@@ -45,6 +45,15 @@ struct
   /* True if we are running detached from the tty. */
   int running_detached;
 
+  /*
+   * Global state variables.
+   */
+
+  /* Whether a global transaction has been requested along with the
+   * caller's pid and whether a transaction is active.  */
+  pid_t transaction_pid;
+  unsigned int in_transaction : 1;
+  unsigned int active_transaction : 1;
 } opt;
 
 
@@ -106,13 +115,19 @@ struct server_control_s
   unsigned long client_pid;
   int client_uid;
 
-  /* Two database request objects used with a connection.  They are
+  /* The database request object used with a connection.  It is
    * auto-created as needed.  */
-  db_request_t opgp_req;
-  db_request_t x509_req;
+  db_request_t db_req;
 
   /* Flags for the current request.  */
-  unsigned int no_data_return : 1;  /* Used by SEARCH and NEXT.  */
+
+  /* If the any of the filter flags are set a search returns only
+   * results with a blob type matching one of these filter flags.  */
+  unsigned int filter_opgp : 1;
+  unsigned int filter_x509 : 1;
+  /* Used by SEARCH and NEXT.  */
+  unsigned int no_data_return : 1;
+
 };
 
 

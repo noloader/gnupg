@@ -307,6 +307,7 @@ cmd_serialno (assuan_context_t ctx, char *line)
   char *serial;
   const char *demand;
   int opt_all = has_option (line, "--all");
+  int thisslot;
 
   if ( IS_LOCKED (ctrl) )
     return gpg_error (GPG_ERR_LOCKED);
@@ -327,22 +328,22 @@ cmd_serialno (assuan_context_t ctx, char *line)
   line = skip_options (line);
 
   /* Clear the remove flag so that the open_card is able to reread it.  */
-  if (ctrl->server_local->card_removed)
-    ctrl->server_local->card_removed = 0;
-
-  if ((rc = open_card_with_request (ctrl, *line? line:NULL, demand, opt_all)))
-    {
-      ctrl->server_local->card_removed = 1;
-      return rc;
-    }
-
-  /* Success, clear the card_removed flag for all sessions.  */
+  ctrl->server_local->card_removed = 0;
+  rc = open_card_with_request (ctrl, *line? line:NULL, demand, opt_all);
+  /* Now clear or set the card_removed flag for all sessions using the
+   * current slot.  In the error case make sure that the flag is set
+   * for the current session. */
+  thisslot = ctrl->card_ctx? ctrl->card_ctx->slot : -1;
   for (sl=session_list; sl; sl = sl->next_session)
     {
       ctrl_t c = sl->ctrl_backlink;
-
-      if (c != ctrl)
-        c->server_local->card_removed = 0;
+      if (c && c->card_ctx && c->card_ctx->slot == thisslot)
+        c->server_local->card_removed = rc? 1 : 0;
+    }
+  if (rc)
+    {
+      ctrl->server_local->card_removed = 1;
+      return rc;
     }
 
   serial = card_get_serialno (ctrl->card_ctx);
@@ -432,7 +433,7 @@ static const char hlp_learn[] =
   "or a \"CANCEL\" to force the function to terminate with a Cancel\n"
   "error message.\n"
   "\n"
-  "With the option --keypairinfo only KEYPARIINFO status lines are\n"
+  "With the option --keypairinfo only KEYPAIRINFO status lines are\n"
   "returned.\n"
   "\n"
   "The response of this command is a list of status lines formatted as\n"
@@ -649,9 +650,11 @@ do_readkey (card_t card, ctrl_t ctrl, const char *line,
       if (opt_info)
         {
           char keygripstr[KEYGRIP_LEN*2+1];
+          char *algostr;
 
           rc = app_help_get_keygrip_string_pk (*pk_p, *pklen_p,
-                                               keygripstr, NULL);
+                                               keygripstr, NULL, NULL,
+                                               &algostr);
           if (rc)
             {
               log_error ("app_help_get_keygrip_string failed: %s\n",
@@ -664,7 +667,11 @@ do_readkey (card_t card, ctrl_t ctrl, const char *line,
           send_status_info (ctrl, "KEYPAIRINFO",
                             keygripstr, strlen (keygripstr),
                             line, strlen (line),
+                            "-", (size_t)1,
+                            "-", (size_t)1,
+                            algostr, strlen (algostr),
                             NULL, (size_t)0);
+          xfree (algostr);
         }
     }
   else
@@ -890,7 +897,7 @@ pin_cb (void *opaque, const char *info, char **retstr)
 
 
 static const char hlp_pksign[] =
-  "PKSIGN [--hash=[rmd160|sha{1,224,256,384,512}|md5]] <hexified_id>\n"
+  "PKSIGN [--hash=[rmd160|sha{1,224,256,384,512}|md5|none]] <hexified_id>\n"
   "\n"
   "The --hash option is optional; the default is SHA1.";
 static gpg_error_t
@@ -919,6 +926,8 @@ cmd_pksign (assuan_context_t ctx, char *line)
     hash_algo = GCRY_MD_SHA512;
   else if (has_option (line, "--hash=md5"))
     hash_algo = GCRY_MD_MD5;
+  else if (has_option (line, "--hash=none"))  /* For raw RSA.  */
+    hash_algo = 0;
   else if (!strstr (line, "--"))
     hash_algo = GCRY_MD_SHA1;
   else
@@ -1930,6 +1939,8 @@ cmd_apdu (assuan_context_t ctx, char *line)
   size_t exlen;
 
   if (has_option (line, "--dump-atr"))
+    with_atr = 3;
+  else if (has_option (line, "--data-atr"))
     with_atr = 2;
   else
     with_atr = has_option (line, "--atr");
@@ -1966,7 +1977,7 @@ cmd_apdu (assuan_context_t ctx, char *line)
           rc = gpg_error (GPG_ERR_INV_CARD);
           goto leave;
         }
-      if (with_atr == 2)
+      if (with_atr == 3)
         {
           char *string, *p, *pend;
 
@@ -1983,7 +1994,19 @@ cmd_apdu (assuan_context_t ctx, char *line)
                 rc = assuan_send_data (ctx, p, strlen (p));
               es_free (string);
               if (rc)
-                goto leave;
+                {
+                  xfree (atr);
+                  goto leave;
+                }
+            }
+        }
+      else if (with_atr == 2)
+        {
+          rc = assuan_send_data (ctx, atr, atrlen);
+          if (rc)
+            {
+              xfree (atr);
+              goto leave;
             }
         }
       else
@@ -2494,7 +2517,7 @@ void
 pincache_put (ctrl_t ctrl, int slot, const char *appname, const char *pinref,
               const char *pin, unsigned int pinlen)
 {
-  gpg_error_t err;
+  gpg_error_t err = 0;
   assuan_context_t ctx;
   char line[950];
   gcry_cipher_hd_t cipherhd = NULL;

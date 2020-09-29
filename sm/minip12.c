@@ -18,71 +18,36 @@
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
+/* References:
+ * RFC-7292 - PKCS #12: Personal Information Exchange Syntax v1.1
+ * RFC-8351 - The PKCS #8 EncryptedPrivateKeyInfo Media Type
+ * RFC-5958 - Asymmetric Key Packages
+ * RFC-3447 - PKCS  #1: RSA Cryptography Specifications Version 2.1
+ * RFC-5915 - Elliptic Curve Private Key Structure
+ */
+
 #ifdef HAVE_CONFIG_H
 #include <config.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <gcrypt.h>
 #include <errno.h>
 
-#ifdef TEST
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
+#include <ksba.h>
 
+#include "../common/util.h"
 #include "../common/logging.h"
 #include "../common/utf8conv.h"
+#include "../common/tlv.h"
+#include "../common/openpgpdefs.h" /* Only for openpgp_curve_to_oid.  */
 #include "minip12.h"
 
 #ifndef DIM
 #define DIM(v)		     (sizeof(v)/sizeof((v)[0]))
 #endif
 
-
-enum
-{
-  UNIVERSAL = 0,
-  APPLICATION = 1,
-  ASNCONTEXT = 2,
-  PRIVATE = 3
-};
-
-
-enum
-{
-  TAG_NONE = 0,
-  TAG_BOOLEAN = 1,
-  TAG_INTEGER = 2,
-  TAG_BIT_STRING = 3,
-  TAG_OCTET_STRING = 4,
-  TAG_NULL = 5,
-  TAG_OBJECT_ID = 6,
-  TAG_OBJECT_DESCRIPTOR = 7,
-  TAG_EXTERNAL = 8,
-  TAG_REAL = 9,
-  TAG_ENUMERATED = 10,
-  TAG_EMBEDDED_PDV = 11,
-  TAG_UTF8_STRING = 12,
-  TAG_REALTIVE_OID = 13,
-  TAG_SEQUENCE = 16,
-  TAG_SET = 17,
-  TAG_NUMERIC_STRING = 18,
-  TAG_PRINTABLE_STRING = 19,
-  TAG_TELETEX_STRING = 20,
-  TAG_VIDEOTEX_STRING = 21,
-  TAG_IA5_STRING = 22,
-  TAG_UTC_TIME = 23,
-  TAG_GENERALIZED_TIME = 24,
-  TAG_GRAPHIC_STRING = 25,
-  TAG_VISIBLE_STRING = 26,
-  TAG_GENERAL_STRING = 27,
-  TAG_UNIVERSAL_STRING = 28,
-  TAG_CHARACTER_STRING = 29,
-  TAG_BMP_STRING = 30
-};
 
 
 static unsigned char const oid_data[9] = {
@@ -114,7 +79,8 @@ static unsigned char const oid_aes128_CBC[9] = {
 
 static unsigned char const oid_rsaEncryption[9] = {
   0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
-
+static unsigned char const oid_pcPublicKey[7] = {
+  0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01 };
 
 static unsigned char const data_3desiter2048[30] = {
   0x30, 0x1C, 0x06, 0x0A, 0x2A, 0x86, 0x48, 0x86,
@@ -174,6 +140,98 @@ struct tag_info
   int nhdr;
   int ndef;              /* It is an indefinite length */
 };
+
+
+/* Wrapper around tlv_builder_add_ptr to add an OID.  When we
+ * eventually put the whole tlv_builder stuff into Libksba, we can add
+ * such a function there.  Right now we don't do this to avoid a
+ * dependency on Libksba.  Function return 1 on error.  */
+static int
+builder_add_oid (tlv_builder_t tb, int class, const char *oid)
+{
+  gpg_error_t err;
+  unsigned char *der;
+  size_t derlen;
+
+  err = ksba_oid_from_str (oid, &der, &derlen);
+  if (err)
+    {
+      log_error ("%s: error converting '%s' to DER: %s\n",
+                 __func__, oid, gpg_strerror (err));
+      return 1;
+    }
+
+  tlv_builder_add_val (tb, class, TAG_OBJECT_ID, der, derlen);
+  ksba_free (der);
+  return 0;
+}
+
+
+/* Wrapper around tlv_builder_add_ptr to add an MPI.  TAG may either
+ * be OCTET_STRING or BIT_STRING.  When we eventually put the whole
+ * tlv_builder stuff into Libksba, we can add such a function there.
+ * Right now we don't do this to avoid a dependency on Libksba.
+ * Function return 1 on error.  STRIP is a hack to remove the first
+ * octet from the value. */
+static int
+builder_add_mpi (tlv_builder_t tb, int class, int tag, gcry_mpi_t mpi,
+                 int strip)
+{
+  int returncode;
+  gpg_error_t err;
+  const unsigned char *s;
+  unsigned char *freethis = NULL;
+  unsigned char *freethis2 = NULL;
+  unsigned int nbits;
+  size_t n;
+
+  if (gcry_mpi_get_flag (mpi, GCRYMPI_FLAG_OPAQUE))
+    {
+      s = gcry_mpi_get_opaque (mpi, &nbits);
+      n = (nbits+7)/8;
+    }
+  else
+    {
+      err = gcry_mpi_aprint (GCRYMPI_FMT_USG, &freethis, &n, mpi);
+      if (err)
+        {
+          log_error ("%s: error converting MPI: %s\n",
+                     __func__, gpg_strerror (err));
+          returncode = 1;
+          goto leave;
+        }
+      s = freethis;
+    }
+
+  if (tag == TAG_BIT_STRING)
+    {
+      freethis2 = xtrymalloc_secure (n + 1);
+      if (!freethis2)
+        {
+          err = gpg_error_from_syserror ();
+          log_error ("%s: error converting MPI: %s\n",
+                     __func__, gpg_strerror (err));
+          returncode = 1;
+          goto leave;
+        }
+      freethis2[0] = 0;
+      memcpy (freethis2+1, s, n);
+      s = freethis2;
+      n++;
+    }
+
+  strip = !!strip;
+  if (strip && n < 2)
+    strip = 0;
+
+  tlv_builder_add_val (tb, class, tag, s+strip, n-strip);
+  returncode = 0;
+
+ leave:
+  xfree (freethis);
+  xfree (freethis2);
+  return returncode;
+}
 
 
 /* Parse the buffer at the address BUFFER which is of SIZE and return
@@ -247,7 +305,7 @@ parse_tag (unsigned char const **buffer, size_t *size, struct tag_info *ti)
       ti->length = len;
     }
 
-  if (ti->class == UNIVERSAL && !ti->tag)
+  if (ti->class == CLASS_UNIVERSAL && !ti->tag)
     ti->length = 0;
 
   if (ti->length > length)
@@ -298,7 +356,7 @@ cram_octet_string (const unsigned char *input, size_t *length,
     {
       if (parse_tag (&s, &n, &ti))
         goto bailout;
-      if (ti.class == UNIVERSAL && ti.tag == TAG_OCTET_STRING
+      if (ti.class == CLASS_UNIVERSAL && ti.tag == TAG_OCTET_STRING
           && !ti.ndef && !ti.is_constructed)
         {
           memcpy (d, s, ti.length);
@@ -306,7 +364,7 @@ cram_octet_string (const unsigned char *input, size_t *length,
           d += ti.length;
           n -= ti.length;
         }
-      else if (ti.class == UNIVERSAL && !ti.tag && !ti.is_constructed)
+      else if (ti.class == CLASS_UNIVERSAL && !ti.tag && !ti.is_constructed)
         break; /* Ready */
       else
         goto bailout;
@@ -432,7 +490,7 @@ set_key_iv (gcry_cipher_hd_t chd, char *salt, size_t saltlen, int iter,
   unsigned char keybuf[24];
   int rc;
 
-  assert (keybytes == 5 || keybytes == 24);
+  log_assert (keybytes == 5 || keybytes == 24);
   if (string_to_key (1, salt, saltlen, iter, pw, keybytes, keybuf))
     return -1;
   rc = gcry_cipher_setkey (chd, keybuf, keybytes);
@@ -529,7 +587,8 @@ crypt_block (unsigned char *buffer, size_t length, char *salt, size_t saltlen,
   if (rc)
     {
       wipememory (buffer, length);
-      log_error ( "en/de-crytion failed: %s\n", gpg_strerror (rc));
+      log_error ("%scrytion failed (%zu bytes): %s\n",
+                 encrypt?"en":"de", length, gpg_strerror (rc));
       goto leave;
     }
 
@@ -642,7 +701,7 @@ bag_decrypted_data_p (const void *plaintext, size_t length)
 
   /*   { */
   /* #  warning debug code is enabled */
-  /*     FILE *fp = fopen ("tmp-rc2-plain.der", "wb"); */
+  /*     FILE *fp = fopen ("tmp-minip12-plain-data.der", "wb"); */
   /*     if (!fp || fwrite (p, n, 1, fp) != 1) */
   /*       exit (2); */
   /*     fclose (fp); */
@@ -690,7 +749,7 @@ parse_bag_encrypted_data (const unsigned char *buffer, size_t length,
   where = "start";
   if (parse_tag (&p, &n, &ti))
     goto bailout;
-  if (ti.class != ASNCONTEXT || ti.tag)
+  if (ti.class != CLASS_CONTEXT || ti.tag)
     goto bailout;
   if (parse_tag (&p, &n, &ti))
     goto bailout;
@@ -850,7 +909,7 @@ parse_bag_encrypted_data (const unsigned char *buffer, size_t length,
     goto bailout;
 
   consumed = p - p_start;
-  if (ti.class == ASNCONTEXT && ti.tag == 0 && ti.is_constructed && ti.ndef)
+  if (ti.class == CLASS_CONTEXT && ti.tag == 0 && ti.is_constructed && ti.ndef)
     {
       /* Mozilla exported certs now come with single byte chunks of
          octet strings.  (Mozilla Firefox 1.0.4).  Arghh. */
@@ -864,7 +923,7 @@ parse_bag_encrypted_data (const unsigned char *buffer, size_t length,
       r_consumed = NULL; /* Ugly hack to not update that value any further. */
       ti.length = n;
     }
-  else if (ti.class == ASNCONTEXT && ti.tag == 0 && ti.length )
+  else if (ti.class == CLASS_CONTEXT && ti.tag == 0 && ti.length )
     ;
   else
     goto bailout;
@@ -949,7 +1008,7 @@ parse_bag_encrypted_data (const unsigned char *buffer, size_t length,
       where = "certbag.before.certheader";
       if (parse_tag (&p, &n, &ti))
         goto bailout;
-      if (ti.class != ASNCONTEXT || ti.tag)
+      if (ti.class != CLASS_CONTEXT || ti.tag)
         goto bailout;
       if (iscrlbag)
         {
@@ -1068,7 +1127,7 @@ parse_bag_encrypted_data (const unsigned char *buffer, size_t length,
           where = "certbag.before.octetstring";
           if (parse_tag (&p, &n, &ti))
             goto bailout;
-          if (ti.class != ASNCONTEXT || ti.tag)
+          if (ti.class != CLASS_CONTEXT || ti.tag)
             goto bailout;
           if (parse_tag (&p, &n, &ti))
             goto bailout;
@@ -1158,7 +1217,7 @@ bag_data_p (const void *plaintext, size_t length)
 
 /*   { */
 /* #  warning debug code is enabled */
-/*     FILE *fp = fopen ("tmp-3des-plain-key.der", "wb"); */
+/*     FILE *fp = fopen ("tmp-minip12-plain-key.der", "wb"); */
 /*     if (!fp || fwrite (p, n, 1, fp) != 1) */
 /*       exit (2); */
 /*     fclose (fp); */
@@ -1176,7 +1235,7 @@ bag_data_p (const void *plaintext, size_t length)
 
 static gcry_mpi_t *
 parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
-                size_t *r_consumed, const char *pw)
+                size_t *r_consumed, char **r_curve, const char *pw)
 {
   int rc;
   struct tag_info ti;
@@ -1195,11 +1254,12 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
   unsigned char *cram_buffer = NULL;
   size_t consumed = 0; /* Number of bytes consumed from the original buffer. */
   int is_pbes2 = 0;
+  char *curve = NULL;
 
   where = "start";
   if (parse_tag (&p, &n, &ti))
     goto bailout;
-  if (ti.class != ASNCONTEXT || ti.tag)
+  if (ti.class != CLASS_CONTEXT || ti.tag)
     goto bailout;
   if (parse_tag (&p, &n, &ti))
     goto bailout;
@@ -1246,7 +1306,7 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
   where = "shrouded,outerseqs";
   if (parse_tag (&p, &n, &ti))
     goto bailout;
-  if (ti.class != ASNCONTEXT || ti.tag)
+  if (ti.class != CLASS_CONTEXT || ti.tag)
     goto bailout;
   if (parse_tag (&p, &n, &ti))
     goto bailout;
@@ -1409,13 +1469,43 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
   if (len < ti.nhdr)
     goto bailout;
   len -= ti.nhdr;
-  if (ti.class || ti.tag != TAG_OBJECT_ID
-      || ti.length != DIM(oid_rsaEncryption)
-      || memcmp (p, oid_rsaEncryption,
-                 DIM(oid_rsaEncryption)))
+  if (ti.class || ti.tag != TAG_OBJECT_ID)
     goto bailout;
-  p += DIM (oid_rsaEncryption);
-  n -= DIM (oid_rsaEncryption);
+  /* gpgrt_log_printhex (p, ti.length, "OID:"); */
+  if (ti.length == DIM(oid_rsaEncryption)
+      && !memcmp (p, oid_rsaEncryption, DIM(oid_rsaEncryption)))
+    {
+      p += DIM (oid_rsaEncryption);
+      n -= DIM (oid_rsaEncryption);
+    }
+  else if (ti.length == DIM(oid_pcPublicKey)
+           && !memcmp (p, oid_pcPublicKey, DIM(oid_pcPublicKey)))
+    {
+      /* See RFC-5915 for the format.  */
+      p += DIM (oid_pcPublicKey);
+      n -= DIM (oid_pcPublicKey);
+      if (len < ti.length)
+        goto bailout;
+      len -= ti.length;
+      if (n < len)
+        goto bailout;
+      if (parse_tag (&p, &n, &ti))
+        goto bailout;
+      /* gpgrt_log_debug ("ti=%d/%lu len=%lu\n",ti.class,ti.tag,ti.length); */
+      if (len < ti.nhdr)
+        goto bailout;
+      len -= ti.nhdr;
+      if (ti.class || ti.tag != TAG_OBJECT_ID)
+        goto bailout;
+      curve = ksba_oid_to_str (p, ti.length);
+      if (!curve)
+        goto bailout;
+      /* log_debug ("OID of curve is: %s\n", curve); */
+      p += ti.length;
+      n -= ti.length;
+    }
+  else
+    goto bailout;
   if (len < ti.length)
     goto bailout;
   len -= ti.length;
@@ -1438,7 +1528,7 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
   result_count = 0;
 
   where = "reading.key-parameters";
-  for (result_count=0; len && result_count < 9;)
+  if (curve)  /* ECC case.  */
     {
       if (parse_tag (&p, &n, &ti) || ti.class || ti.tag != TAG_INTEGER)
         goto bailout;
@@ -1448,30 +1538,68 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
       if (len < ti.length)
         goto bailout;
       len -= ti.length;
-      if (!result_count && ti.length == 1 && !*p)
-        ; /* ignore the very first one if it is a 0 */
-      else
+      if (ti.length != 1 && *p != 1)
         {
-          rc = gcry_mpi_scan (result+result_count, GCRYMPI_FMT_USG, p,
-                              ti.length, NULL);
-          if (rc)
-            {
-              log_error ("error parsing key parameter: %s\n",
-                         gpg_strerror (rc));
-              goto bailout;
-            }
-          result_count++;
+          log_error ("error parsing private ecPublicKey parameter: %s\n",
+                     "bad version");
+          goto bailout;
         }
       p += ti.length;
       n -= ti.length;
+      if (parse_tag (&p, &n, &ti) || ti.class || ti.tag != TAG_OCTET_STRING)
+        goto bailout;
+      if (len < ti.nhdr)
+        goto bailout;
+      len -= ti.nhdr;
+      if (len < ti.length)
+        goto bailout;
+      len -= ti.length;
+      /* log_printhex (p, ti.length, "ecc q="); */
+      rc = gcry_mpi_scan (result, GCRYMPI_FMT_USG, p, ti.length, NULL);
+      if (rc)
+        {
+          log_error ("error parsing key parameter: %s\n", gpg_strerror (rc));
+          goto bailout;
+        }
+      p += ti.length;
+      n -= ti.length;
+
+      len = 0;  /* Skip the rest.  */
+    }
+  else  /* RSA case */
+    {
+      for (result_count=0; len && result_count < 9;)
+        {
+          if (parse_tag (&p, &n, &ti) || ti.class || ti.tag != TAG_INTEGER)
+            goto bailout;
+          if (len < ti.nhdr)
+            goto bailout;
+          len -= ti.nhdr;
+          if (len < ti.length)
+            goto bailout;
+          len -= ti.length;
+          if (!result_count && ti.length == 1 && !*p)
+            ; /* ignore the very first one if it is a 0 */
+          else
+            {
+              rc = gcry_mpi_scan (result+result_count, GCRYMPI_FMT_USG, p,
+                                  ti.length, NULL);
+              if (rc)
+                {
+                  log_error ("error parsing key parameter: %s\n",
+                             gpg_strerror (rc));
+                  goto bailout;
+                }
+              result_count++;
+            }
+          p += ti.length;
+          n -= ti.length;
+        }
     }
   if (len)
     goto bailout;
 
-  gcry_free (cram_buffer);
-  if (r_consumed)
-    *r_consumed = consumed;
-  return result;
+  goto leave;
 
  bailout:
   gcry_free (plain);
@@ -1481,12 +1609,23 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
         gcry_mpi_release (result[i]);
       gcry_free (result);
     }
-  gcry_free (cram_buffer);
   log_error ( "data error at \"%s\", offset %u\n",
               where, (unsigned int)((p - buffer) + startoffset));
+  result = NULL;
+
+ leave:
+  if (r_curve && result)
+    {
+      *r_curve = curve;
+      curve = NULL;
+    }
+  else if (r_curve)
+    *r_curve = NULL;
+  ksba_free (curve);
+  gcry_free (cram_buffer);
   if (r_consumed)
     *r_consumed = consumed;
-  return NULL;
+  return result;
 }
 
 
@@ -1499,7 +1638,7 @@ parse_bag_data (const unsigned char *buffer, size_t length, int startoffset,
 gcry_mpi_t *
 p12_parse (const unsigned char *buffer, size_t length, const char *pw,
            void (*certcb)(void*, const unsigned char*, size_t),
-           void *certcbarg, int *r_badpass)
+           void *certcbarg, int *r_badpass, char **r_curve)
 {
   struct tag_info ti;
   const unsigned char *p = buffer;
@@ -1510,6 +1649,7 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
   int bagseqndef, lenndef;
   gcry_mpi_t *result = NULL;
   unsigned char *cram_buffer = NULL;
+  char *curve = NULL;
 
   *r_badpass = 0;
   where = "pfx";
@@ -1540,11 +1680,11 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
 
   if (parse_tag (&p, &n, &ti))
     goto bailout;
-  if (ti.class != ASNCONTEXT || ti.tag)
+  if (ti.class != CLASS_CONTEXT || ti.tag)
     goto bailout;
   if (parse_tag (&p, &n, &ti))
     goto bailout;
-  if (ti.class != UNIVERSAL || ti.tag != TAG_OCTET_STRING)
+  if (ti.class != CLASS_UNIVERSAL || ti.tag != TAG_OCTET_STRING)
     goto bailout;
 
   if (ti.is_constructed && ti.ndef)
@@ -1561,7 +1701,7 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
   where = "bags";
   if (parse_tag (&p, &n, &ti))
     goto bailout;
-  if (ti.class != UNIVERSAL || ti.tag != TAG_SEQUENCE)
+  if (ti.class != CLASS_UNIVERSAL || ti.tag != TAG_SEQUENCE)
     goto bailout;
   bagseqndef = ti.ndef;
   bagseqlength = ti.length;
@@ -1571,9 +1711,10 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
       where = "bag-sequence";
       if (parse_tag (&p, &n, &ti))
         goto bailout;
-      if (bagseqndef && ti.class == UNIVERSAL && !ti.tag && !ti.is_constructed)
+      if (bagseqndef && ti.class == CLASS_UNIVERSAL
+          && !ti.tag && !ti.is_constructed)
         break; /* Ready */
-      if (ti.class != UNIVERSAL || ti.tag != TAG_SEQUENCE)
+      if (ti.class != CLASS_UNIVERSAL || ti.tag != TAG_SEQUENCE)
         goto bailout;
 
       if (!bagseqndef)
@@ -1629,7 +1770,8 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
               n -= DIM(oid_data);
               if (!lenndef)
                 len -= DIM(oid_data);
-              result = parse_bag_data (p, n, (p - p_start), &consumed, pw);
+              result = parse_bag_data (p, n, (p - p_start),
+                                       &consumed, &curve, pw);
               if (!result)
                 goto bailout;
               if (lenndef)
@@ -1652,13 +1794,15 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
           /* Need to skip the Null Tag. */
           if (parse_tag (&p, &n, &ti))
             goto bailout;
-          if (!(ti.class == UNIVERSAL && !ti.tag && !ti.is_constructed))
+          if (!(ti.class == CLASS_UNIVERSAL && !ti.tag && !ti.is_constructed))
             goto bailout;
         }
     }
 
   gcry_free (cram_buffer);
+  *r_curve = curve;
   return result;
+
  bailout:
   log_error ("error at \"%s\", offset %u\n",
              where, (unsigned int)(p - p_start));
@@ -1671,6 +1815,8 @@ p12_parse (const unsigned char *buffer, size_t length, const char *pw,
       gcry_free (result);
     }
   gcry_free (cram_buffer);
+  gcry_free (curve);
+  *r_curve = NULL;
   return NULL;
 }
 
@@ -1871,36 +2017,36 @@ create_final (struct buffer_s *sequences, const char *pw, size_t *r_length)
 
 
 /* Build a DER encoded SEQUENCE with the key:
-
-   SEQUENCE {
-     INTEGER 0
-     SEQUENCE {
-       OBJECT IDENTIFIER rsaEncryption (1 2 840 113549 1 1 1)
-       NULL
-       }
-     OCTET STRING, encapsulates {
-       SEQUENCE {
-         INTEGER 0
-         INTEGER
-         INTEGER
-         INTEGER
-         INTEGER
-         INTEGER
-         INTEGER
-         INTEGER
-         INTEGER
-         }
-       }
-     }
-
-  MODE controls what is being generated:
-     0 - As described above
-     1 - Ditto but without the padding
-     2 - Only the inner part (pkcs#1)
-*/
+ *
+ * SEQUENCE {  -- OneAsymmetricKey (RFC-5958)
+ *   INTEGER 0
+ *   SEQUENCE {
+ *     OBJECT IDENTIFIER rsaEncryption (1 2 840 113549 1 1 1)
+ *     NULL
+ *     }
+ *   OCTET STRING, encapsulates {
+ *     SEQUENCE {   -- RSAPrivateKey (RFC-3447)
+ *       INTEGER 0  -- Version
+ *       INTEGER    -- n
+ *       INTEGER    -- e
+ *       INTEGER    -- d
+ *       INTEGER    -- p
+ *       INTEGER    -- q
+ *       INTEGER    -- d mod (p-1)
+ *       INTEGER    -- d mod (q-1)
+ *       INTEGER    -- q^-1 mod p
+ *       }
+ *     }
+ *   }
+ *
+ * MODE controls what is being generated:
+ *   0 - As described above
+ *   1 - Ditto but without the padding
+ *   2 - Only the inner part (pkcs#1)
+ */
 
 static unsigned char *
-build_key_sequence (gcry_mpi_t *kparms, int mode, size_t *r_length)
+build_rsa_key_sequence (gcry_mpi_t *kparms, int mode, size_t *r_length)
 {
   int rc, i;
   size_t needed, n;
@@ -2016,7 +2162,7 @@ build_key_sequence (gcry_mpi_t *kparms, int mode, size_t *r_length)
     }
 
   plainlen = p - plain;
-  assert (needed == plainlen);
+  log_assert (needed == plainlen);
 
   if (!mode)
     {
@@ -2030,6 +2176,156 @@ build_key_sequence (gcry_mpi_t *kparms, int mode, size_t *r_length)
   return plain;
 }
 
+
+/* Build a DER encoded SEQUENCE for an ECC key:
+ *
+ * SEQUENCE {  -- OneAsymmetricKey (RFC-5958)
+ *   INTEGER 0
+ *   SEQUENCE {
+ *     OBJECT IDENTIFIER ecPublicKey (1 2 840 10045 2 1)
+ *     OBJECT IDENTIFIER -- curvename
+ *     }
+ *   OCTET STRING, encapsulates {
+ *     SEQUENCE {      -- ECPrivateKey
+ *       INTEGER  1    --  version
+ *       OCTET STRING  -- privateKey
+ *       [1] {
+ *          BIT STRING - publicKey
+ *       }
+ *     }
+ *   }
+ * }
+ *
+ * For details see RFC-5480 and RFC-5915 (ECparameters are not created).
+ *
+ * KPARMS[0] := Opaque MPI with the curve name as dotted-decimal string.
+ * KPARMS[1] := Opaque MPI with the pgublic key (q)
+ * KPARMS[2] := Opaque MPI with the private key (d)
+ * MODE controls what is being generated:
+ *    0 - As described above
+ *    1 - Ditto but without the extra padding needed for pcsk#12
+ *    2 - Only the octet string (ECPrivateKey)
+ */
+
+static unsigned char *
+build_ecc_key_sequence (gcry_mpi_t *kparms, int mode, size_t *r_length)
+{
+  gpg_error_t err;
+  unsigned int nbits, n;
+  const unsigned char *s;
+  char *p;
+  tlv_builder_t tb;
+  void *result;
+  size_t resultlen;
+  const char *curve;
+  unsigned int curvebits;
+  int e;
+  int i;
+  int strip_one;
+
+  for (i=0; kparms[i]; i++)
+    ;
+  if (i != 3)
+    {
+      log_error ("%s: invalid number of parameters\n", __func__);
+      return NULL;
+    }
+
+  s = gcry_mpi_get_opaque (kparms[0], &nbits);
+  n = (nbits+7)/8;
+  p = xtrymalloc (n + 1);
+  if (!p)
+    {
+      err = gpg_error_from_syserror ();
+      log_error ("%s:%d: error getting parameter: %s\n",
+                 __func__, __LINE__, gpg_strerror (err));
+      return NULL;
+    }
+  memcpy (p, s, n);
+  p[n] = 0;
+  /* We need to use our OpenPGP mapping to turn a curve name into its
+   * canonical numerical OID.  We should have a Libgcrypt function to
+   * do this; see bug report #4926.  */
+  curve = openpgp_curve_to_oid (p, &curvebits, NULL);
+  xfree (p);
+  if (!curve)
+    {
+      err = gpg_error (GPG_ERR_UNKNOWN_CURVE);
+      log_error ("%s:%d: error getting parameter: %s\n",
+                 __func__, __LINE__, gpg_strerror (err));
+      return NULL;
+    }
+
+  /* Unfortunately the private key D may come with a single leading
+   * zero byte.  This is becuase at some point it was treated as
+   * signed MPI and the code made sure that it is always interpreted
+   * as unsigned.  Fortunately we got the size of the curve and can
+   * detect such a case reliable.  */
+  s = gcry_mpi_get_opaque (kparms[2], &nbits);
+  n = (nbits+7)/8;
+  strip_one = (n == (curvebits+7)/8 + 1 && !*s);
+
+
+  tb = tlv_builder_new (1);
+  if (!tb)
+    {
+      err = gpg_error_from_syserror ();
+      log_error ("%s:%d: error creating new TLV builder: %s\n",
+                 __func__, __LINE__, gpg_strerror (err));
+      return NULL;
+    }
+  e = 0;
+  tlv_builder_add_tag (tb, 0, TAG_SEQUENCE);
+  tlv_builder_add_ptr (tb, 0, TAG_INTEGER, "\0", 1);
+  tlv_builder_add_tag (tb, 0, TAG_SEQUENCE);
+  e|= builder_add_oid (tb, 0, "1.2.840.10045.2.1");
+  e|= builder_add_oid (tb, 0, curve);
+  tlv_builder_add_end (tb);
+  tlv_builder_add_tag (tb, 0, TAG_OCTET_STRING);
+  tlv_builder_add_tag (tb, 0, TAG_SEQUENCE);
+  tlv_builder_add_ptr (tb, 0, TAG_INTEGER, "\x01", 1);
+  e|= builder_add_mpi (tb, 0, TAG_OCTET_STRING, kparms[2], strip_one);
+  tlv_builder_add_tag (tb, CLASS_CONTEXT, 1);
+  e|= builder_add_mpi (tb, 0, TAG_BIT_STRING, kparms[1], 0);
+  tlv_builder_add_end (tb);
+  tlv_builder_add_end (tb);
+  tlv_builder_add_end (tb);
+  tlv_builder_add_end (tb);
+
+  err = tlv_builder_finalize (tb, &result, &resultlen);
+  if (err || e)
+    {
+      if (!err)
+        err = gpg_error (GPG_ERR_GENERAL);
+      log_error ("%s:%d: tlv building failed: %s\n",
+                 __func__, __LINE__, gpg_strerror (err));
+      return NULL;
+    }
+
+  /* Append some pad characters if needed. */
+  if (!mode && (n = 8 - resultlen % 8))
+    {
+      p = xtrymalloc_secure (resultlen + n);
+      if (!p)
+        {
+          err = gpg_error_from_syserror ();
+          log_error ("%s:%d: error allocating buffer: %s\n",
+                     __func__, __LINE__, gpg_strerror (err));
+          xfree (result);
+          return NULL;
+        }
+      memcpy (p, result, resultlen);
+      xfree (result);
+      result = p;
+      p = (unsigned char*)result + resultlen;
+      for (i=0; i < n; i++, resultlen++)
+        *p++ = n;
+    }
+
+  *r_length = resultlen;
+
+  return result;
+}
 
 
 static unsigned char *
@@ -2270,7 +2566,7 @@ build_cert_sequence (const unsigned char *buffer, size_t buflen,
   size_t certseqlen;
   int i;
 
-  assert (strlen (keyidstr) == 8);
+  log_assert (strlen (keyidstr) == 8);
 
   /* Walk 8 steps down to collect the info: */
 
@@ -2475,7 +2771,16 @@ p12_build (gcry_mpi_t *kparms, const void *cert, size_t certlen,
   if (kparms)
     {
       /* Encode the key. */
-      buffer = build_key_sequence (kparms, 0, &buflen);
+      int i;
+
+      /* Right, that is a stupid way to distinguish ECC from RSA.  */
+      for (i=0; kparms[i]; i++)
+        ;
+
+      if (i == 3 && gcry_mpi_get_flag (kparms[0], GCRYMPI_FLAG_OPAQUE))
+        buffer = build_ecc_key_sequence (kparms, 0, &buflen);
+      else
+        buffer = build_rsa_key_sequence (kparms, 0, &buflen);
       if (!buffer)
         goto failure;
 
@@ -2527,94 +2832,21 @@ p12_raw_build (gcry_mpi_t *kparms, int rawmode, size_t *r_length)
 {
   unsigned char *buffer;
   size_t buflen;
+  int i;
 
-  assert (rawmode == 1 || rawmode == 2);
-  buffer = build_key_sequence (kparms, rawmode, &buflen);
+  log_assert (rawmode == 1 || rawmode == 2);
+
+  /* Right, that is a stupid way to distinguish ECC from RSA.  */
+  for (i=0; kparms[i]; i++)
+    ;
+
+  if (gcry_mpi_get_flag (kparms[0], GCRYMPI_FLAG_OPAQUE))
+    buffer = build_ecc_key_sequence (kparms, rawmode, &buflen);
+  else
+    buffer = build_rsa_key_sequence (kparms, rawmode, &buflen);
   if (!buffer)
     return NULL;
 
   *r_length = buflen;
   return buffer;
 }
-
-
-#ifdef TEST
-
-static void
-cert_cb (void *opaque, const unsigned char *cert, size_t certlen)
-{
-  printf ("got a certificate of %u bytes length\n", certlen);
-}
-
-int
-main (int argc, char **argv)
-{
-  FILE *fp;
-  struct stat st;
-  unsigned char *buf;
-  size_t buflen;
-  gcry_mpi_t *result;
-  int badpass;
-
-  if (argc != 3)
-    {
-      fprintf (stderr, "usage: testp12 file passphrase\n");
-      return 1;
-    }
-
-  gcry_control (GCRYCTL_DISABLE_SECMEM, NULL);
-  gcry_control (GCRYCTL_INITIALIZATION_FINISHED, NULL);
-
-  fp = fopen (argv[1], "rb");
-  if (!fp)
-    {
-      fprintf (stderr, "can't open '%s': %s\n", argv[1], strerror (errno));
-      return 1;
-    }
-
-  if (fstat (fileno(fp), &st))
-    {
-      fprintf (stderr, "can't stat '%s': %s\n", argv[1], strerror (errno));
-      return 1;
-    }
-
-  buflen = st.st_size;
-  buf = gcry_malloc (buflen+1);
-  if (!buf || fread (buf, buflen, 1, fp) != 1)
-    {
-      fprintf (stderr, "error reading '%s': %s\n", argv[1], strerror (errno));
-      return 1;
-    }
-  fclose (fp);
-
-  result = p12_parse (buf, buflen, argv[2], cert_cb, NULL, &badpass);
-  if (result)
-    {
-      int i, rc;
-      unsigned char *tmpbuf;
-
-      for (i=0; result[i]; i++)
-        {
-          rc = gcry_mpi_aprint (GCRYMPI_FMT_HEX, &tmpbuf,
-                                NULL, result[i]);
-          if (rc)
-            printf ("%d: [error printing number: %s]\n",
-                    i, gpg_strerror (rc));
-          else
-            {
-              printf ("%d: %s\n", i, tmpbuf);
-              gcry_free (tmpbuf);
-            }
-        }
-    }
-
-  return 0;
-
-}
-
-/*
-Local Variables:
-compile-command: "gcc -Wall -O0 -g -DTEST=1 -o minip12 minip12.c ../common/libcommon.a -L /usr/local/lib -lgcrypt -lgpg-error"
-End:
-*/
-#endif /* TEST */

@@ -1,5 +1,5 @@
 /* backend-sqlite.c - SQLite based backend for keyboxd
- * Copyright (C) 2019 g10 Code GmbH
+ * Copyright (C) 2019, 2020 g10 Code GmbH
  *
  * This file is part of GnuPG.
  *
@@ -67,8 +67,19 @@ struct be_sqlite_local_s
   /* The statement object of the current select command.  */
   sqlite3_stmt *select_stmt;
 
+  /* The column numbers for UIDNO and SUBKEY or 0.  */
+  int select_col_uidno;
+  int select_col_subkey;
+
   /* The search mode represented by the current select command.  */
   KeydbSearchMode select_mode;
+
+  /* The flags active when the select was first done.  */
+  unsigned int filter_opgp : 1;
+  unsigned int filter_x509 : 1;
+
+  /* The current description index.  */
+  unsigned int descidx;
 
   /* The select statement has been executed with success.  */
   int select_done;
@@ -85,7 +96,10 @@ static sqlite3 *database_hd;
 /* A lockfile used make sure only we are accessing the database.  */
 static dotlock_t database_lock;
 
+/* The version of our current database schema.  */
+#define DATABASE_VERSION 1
 
+/* Table definitions for the database.  */
 static struct
 {
   const char *sql;
@@ -100,7 +114,7 @@ static struct
     *   created = <ISO time string>
     */
    { "CREATE TABLE IF NOT EXISTS config ("
-     "name  TEXT NOT NULL,"
+     "name  TEXT NOT NULL UNIQUE,"
      "value TEXT NOT NULL "
      ")", 1 },
 
@@ -111,6 +125,10 @@ static struct
      "ubid     BLOB NOT NULL PRIMARY KEY,"
      /* The type of the public key: 1 = openpgp, 2 = X.509.  */
      "type  INTEGER NOT NULL,"
+     /* The Ephemeral flag as used by gpgsm. Values: 0 or 1. */
+     "ephemeral INTEGER NOT NULL DEFAULT 0,"
+     /* The Revoked flag as set by gpgsm. Values: 0 or 1. */
+     "revoked INTEGER NOT NULL DEFAULT 0,"
      /* The OpenPGP keyblock or X.509 certificate.  */
      "keyblob BLOB NOT NULL"
      ")"  },
@@ -119,12 +137,15 @@ static struct
     * It is also used for the primary key and the X.509 fingerprint
     * because we want to be able to use the keyid and keygrip.  */
    { "CREATE TABLE IF NOT EXISTS fingerprint ("
+     /* The fingerprint, for OpenPGP either 20 octets or 32 octets;
+      * for X.509 it is the same as the UBID.  */
      "fpr  BLOB NOT NULL PRIMARY KEY,"
-     /* The long keyid as 64 bit integer.  */
-     "kid  INTEGER NOT NULL,"
+     /* The long keyid as a 64 bit blob.  */
+     "kid  BLOB NOT NULL,"
      /* The keygrip for this key.  */
      "keygrip BLOB NOT NULL,"
-     /* 0 = primary, > 0 = subkey.  */
+     /* 0 = primary or X.509, > 0 = subkey.  Also used as
+      * order number for the keys similar to uidno.  */
      "subkey INTEGER NOT NULL,"
      /* The Unique Blob ID (possibly truncated fingerprint).  */
      "ubid BLOB NOT NULL REFERENCES pubkey"
@@ -135,15 +156,19 @@ static struct
    { "CREATE INDEX IF NOT EXISTS fingerprintidx1 on fingerprint (fpr)"     },
    { "CREATE INDEX IF NOT EXISTS fingerprintidx2 on fingerprint (keygrip)" },
 
-
    /* Table to allow fast access via user ids or mail addresses.  */
    { "CREATE TABLE IF NOT EXISTS userid ("
-     /* The full user id.  */
+     /* The full user id - for X.509 the Subject or altSubject.  */
      "uid  TEXT NOT NULL,"
      /* The mail address if available or NULL.  */
      "addrspec TEXT,"
      /* The type of the public key: 1 = openpgp, 2 = X.509.  */
      "type  INTEGER NOT NULL,"
+     /* The order number of the user id within the keyblock or
+      * certificates.  For X.509 0 is reserved for the issuer, 1 the
+      * subject, 2 and up the altSubjects.  For OpenPGP this starts
+      * with 1 for the first user id in the keyblock.  */
+     "uidno INTEGER NOT NULL,"
      /* The Unique Blob ID (possibly truncated fingerprint).  */
      "ubid BLOB NOT NULL REFERENCES pubkey"
      ")"  },
@@ -151,13 +176,28 @@ static struct
    /* Indices for the userid table.  */
    { "CREATE INDEX IF NOT EXISTS userididx0 on userid (ubid)"     },
    { "CREATE INDEX IF NOT EXISTS userididx1 on userid (uid)"      },
-   { "CREATE INDEX IF NOT EXISTS userididx3 on userid (addrspec)" }
+   { "CREATE INDEX IF NOT EXISTS userididx3 on userid (addrspec)" },
+
+   /* Table to allow fast access via s/n + issuer DN  (X.509 only).  */
+   { "CREATE TABLE IF NOT EXISTS issuer ("
+     /* The hex encoded S/N.  */
+     "sn TEXT NOT NULL,"
+     /* The RFC2253 issuer DN.  */
+     "dn TEXT NOT NULL,"
+     /* The Unique Blob ID (usually the truncated fingerprint).  */
+     "ubid BLOB NOT NULL REFERENCES pubkey"
+     ")"  },
+   { "CREATE INDEX IF NOT EXISTS issueridx1 on issuer (dn)" }
 
   };
 
 
+/*-- prototypes --*/
+static gpg_error_t get_config_value (const char *name, char **r_value);
+static gpg_error_t set_config_value (const char *name, const char *value);
 
 
+
 /* Take a lock for accessing SQLite.  */
 static void
 acquire_mutex (void)
@@ -242,29 +282,23 @@ diag_step_err (int res, sqlite3_stmt *stmt)
 }
 
 
-/* We store the keyid in the database as an integer - this function
- * converts it from a memory buffer.  */
-static GPGRT_INLINE sqlite3_int64
-kid_from_mem (const unsigned char *keyid)
+/* We store the keyid in the database as an 8 byte blob.  This
+ * function converts it from the usual u32[2] array.  BUFFER is a
+ * caller provided buffer of at least 8 bytes; a pointer to that
+ * buffer is the return value.  */
+static GPGRT_INLINE unsigned char *
+kid_from_u32 (u32 *keyid, unsigned char *buffer)
 {
-  return (  ((uint64_t)keyid[0] << 56)
-          | ((uint64_t)keyid[1] << 48)
-          | ((uint64_t)keyid[2] << 40)
-          | ((uint64_t)keyid[3] << 32)
-          | ((uint64_t)keyid[4] << 24)
-          | ((uint64_t)keyid[5] << 16)
-          | ((uint64_t)keyid[6] << 8)
-          | ((uint64_t)keyid[7])
-          );
-}
+  buffer[0] = keyid[0] >> 24;
+  buffer[1] = keyid[0] >> 16;
+  buffer[2] = keyid[0] >> 8;
+  buffer[3] = keyid[0];
+  buffer[4] = keyid[1] >> 24;
+  buffer[5] = keyid[1] >> 16;
+  buffer[6] = keyid[1] >> 8;
+  buffer[7] = keyid[1];
 
-
-/* We store the keyid in the database as an integer - this function
- * converts it from the usual u32[2] array.  */
-static GPGRT_INLINE sqlite3_int64
-kid_from_u32 (u32 *keyid)
-{
-  return (((uint64_t)keyid[0] << 32) | ((uint64_t)keyid[1]) );
+  return buffer;
 }
 
 
@@ -288,18 +322,29 @@ run_sql_reset (sqlite3_stmt *stmt)
 }
 
 
-/* Run an SQL prepare for SQLSTR and return a statement at R_STMT.  */
+/* Run an SQL prepare for SQLSTR and return a statement at R_STMT.  If
+ * EXTRA is not NULL that part is appended to the SQL statement.  */
 static gpg_error_t
-run_sql_prepare (const char *sqlstr, sqlite3_stmt **r_stmt)
+run_sql_prepare (const char *sqlstr, const char *extra, sqlite3_stmt **r_stmt)
 {
   gpg_error_t err;
   int res;
+  char *buffer = NULL;
+
+  if (extra)
+    {
+      buffer = strconcat (sqlstr, extra, NULL);
+      if (!buffer)
+        return gpg_error_from_syserror ();
+      sqlstr = buffer;
+    }
 
   res = sqlite3_prepare_v2 (database_hd, sqlstr, -1, r_stmt, NULL);
   if (res)
     err = diag_prepare_err (res, sqlstr);
   else
     err = 0;
+  xfree (buffer);
   return err;
 }
 
@@ -337,14 +382,17 @@ run_sql_bind_int (sqlite3_stmt *stmt, int no, int value)
 }
 
 
-/* Helper to bind an INTEGER64 parameter to a statement.  */
+/* Helper to bind a string parameter to a statement.  VALUE is allowed
+ * to be NULL to bind NULL.  */
 static gpg_error_t
-run_sql_bind_int64 (sqlite3_stmt *stmt, int no, sqlite3_int64 value)
+run_sql_bind_ntext (sqlite3_stmt *stmt, int no,
+                    const char *value, size_t valuelen)
 {
   gpg_error_t err;
   int res;
 
-  res = sqlite3_bind_int64 (stmt, no, value);
+  res = sqlite3_bind_text (stmt, no, value, value? valuelen:0,
+                           SQLITE_TRANSIENT);
   if (res)
     err = diag_bind_err (res, stmt);
   else
@@ -358,16 +406,7 @@ run_sql_bind_int64 (sqlite3_stmt *stmt, int no, sqlite3_int64 value)
 static gpg_error_t
 run_sql_bind_text (sqlite3_stmt *stmt, int no, const char *value)
 {
-  gpg_error_t err;
-  int res;
-
-  res = sqlite3_bind_text (stmt, no, value, value? strlen (value):0,
-                           SQLITE_TRANSIENT);
-  if (res)
-    err = diag_bind_err (res, stmt);
-  else
-    err = 0;
-  return err;
+  return run_sql_bind_ntext (stmt, no, value, value? strlen (value):0);
 }
 
 
@@ -412,6 +451,7 @@ run_sql_step (sqlite3_stmt *stmt)
   gpg_error_t err;
   int res;
 
+  show_sqlstmt (stmt);
   res = sqlite3_step (stmt);
   if (res != SQLITE_DONE)
     err = diag_step_err (res, stmt);
@@ -449,7 +489,7 @@ run_sql_step_for_select (sqlite3_stmt *stmt)
 
 
 /* Run the simple SQL statement in SQLSTR.  If UBID is not NULL this
- * will be bound to :1 in SQLSTR.  This command may not be used for
+ * will be bound to ?1 in SQLSTR.  This command may not be used for
  * select or other command which return rows.  */
 static gpg_error_t
 run_sql_statement_bind_ubid (const char *sqlstr, const unsigned char *ubid)
@@ -457,7 +497,7 @@ run_sql_statement_bind_ubid (const char *sqlstr, const unsigned char *ubid)
   gpg_error_t err;
   sqlite3_stmt *stmt;
 
-  err = run_sql_prepare (sqlstr, &stmt);
+  err = run_sql_prepare (sqlstr, NULL, &stmt);
   if (err)
     goto leave;
   if (ubid)
@@ -495,6 +535,9 @@ create_or_open_database (const char *filename)
   gpg_error_t err;
   int res;
   int idx;
+  char *value;
+  int dbversion;
+  int setdbversion = 0;
 
   if (database_hd)
     return 0;  /* Already initialized.  */
@@ -555,12 +598,52 @@ create_or_open_database (const char *filename)
       if (table_definitions[idx].special == 1)
         {
           /* Check and create dbversion etc entries.  */
-          // FIXME
+          err = get_config_value ("dbversion", &value);
+          if (gpg_err_code (err) == GPG_ERR_NOT_FOUND)
+            {
+              dbversion = 0;
+              setdbversion = 1;
+            }
+          else if (err)
+            {
+              log_error ("error reading database version: %s\n",
+                         gpg_strerror (err));
+              err = 0;
+              dbversion = 0;
+            }
+          else if ((dbversion = atoi (value)) < 1)
+            {
+              log_error ("database version %d is not valid\n", dbversion);
+              dbversion = 0;
+            }
+          log_info ("database version: %d\n", dbversion);
+
+          xfree (value);
+          err = get_config_value ("created", &value);
+          if (gpg_err_code (err) == GPG_ERR_NOT_FOUND)
+            log_info ("database created: %.50s\n", "[unknown]");
+          else if (err)
+            log_error ("error getting database creation date: %s\n",
+                       gpg_strerror (err));
+          else
+            log_info ("database created: %.50s\n", value);
+
+          xfree (value);
+          value = NULL;
         }
     }
 
   if (!opt.quiet)
     log_info (_("database '%s' created\n"), filename);
+
+  if (setdbversion)
+    {
+      err = set_config_value ("dbversion", STR2(DATABASE_VERSION));
+      if (!err)
+        err = set_config_value ("created", isotimestamp (gnupg_get_time ()));
+    }
+
+
   err = 0;
 
  leave:
@@ -648,16 +731,122 @@ be_sqlite_release_local (be_sqlite_local_t ctx)
 }
 
 
+gpg_error_t
+be_sqlite_rollback (void)
+{
+  opt.in_transaction = 0;
+  if (!opt.active_transaction)
+    return 0;  /* Nothing to do.  */
+
+  if (!database_hd)
+    {
+      log_error ("Warning: No database handle for global rollback\n");
+      return gpg_error (GPG_ERR_INTERNAL);
+    }
+
+  opt.active_transaction = 0;
+  return run_sql_statement ("rollback");
+}
+
+
+gpg_error_t
+be_sqlite_commit (void)
+{
+  opt.in_transaction = 0;
+  if (!opt.active_transaction)
+    return 0;  /* Nothing to do.  */
+
+  if (!database_hd)
+    {
+      log_error ("Warning: No database handle for global commit\n");
+      return gpg_error (GPG_ERR_INTERNAL);
+    }
+
+  opt.active_transaction = 0;
+  return run_sql_statement ("commit");
+}
+
+
+/* Return a value from the config table.  NAME most not have quotes
+ * etc.  If no error is returned the caller must xfree the value
+ * stored at R_VALUE.  On error NULL is stored there.  */
+static gpg_error_t
+get_config_value (const char *name, char **r_value)
+{
+  gpg_error_t err;
+  sqlite3_stmt *stmt;
+  char *sqlstr;
+  const char *s;
+
+  *r_value = NULL;
+
+  sqlstr = strconcat ("SELECT value FROM config WHERE name='", name, "'", NULL);
+  if (!sqlstr)
+    return gpg_error_from_syserror ();
+
+  err = run_sql_prepare (sqlstr, NULL, &stmt);
+  xfree (sqlstr);
+  if (err)
+    return err;
+
+  err = run_sql_step_for_select (stmt);
+  if (gpg_err_code (err) == GPG_ERR_SQL_ROW)
+    {
+      s = sqlite3_column_text (stmt, 0);
+      *r_value = xtrystrdup (s? s : "");
+      if (!*r_value)
+        err = gpg_error_from_syserror ();
+      else
+        err = 0;
+    }
+  else if (gpg_err_code (err) == GPG_ERR_SQL_DONE)
+    err = gpg_error (GPG_ERR_NOT_FOUND);
+  else
+    log_assert (err);  /* We'll never see 0 here.  */
+
+  sqlite3_finalize (stmt);
+
+  return err;
+}
+
+
+/* Insert or update a value in the config table.  */
+static gpg_error_t
+set_config_value (const char *name, const char *value)
+{
+  gpg_error_t err;
+  sqlite3_stmt *stmt;
+
+  err = run_sql_prepare ("INSERT OR REPLACE INTO config(name,value)"
+                         " VALUES(?1,?2)", NULL, &stmt);
+  if (err)
+    return err;
+
+  err = run_sql_bind_text (stmt, 1, name);
+  if (!err)
+    err = run_sql_bind_text (stmt, 2, value);
+  if (!err)
+    err = run_sql_step (stmt);
+
+  sqlite3_finalize (stmt);
+
+  return err;
+}
+
+
 /* Run a select for the search given by (DESC,NDESC).  The data is not
  * returned but stored in the request item.  */
 static gpg_error_t
-run_select_statement (be_sqlite_local_t ctx,
+run_select_statement (ctrl_t ctrl, be_sqlite_local_t ctx,
                       KEYDB_SEARCH_DESC *desc, unsigned int ndesc)
 {
   gpg_error_t err = 0;
   unsigned int descidx;
+  const char *extra = NULL;
+  unsigned char kidbuf[8];
 
-  descidx = 0; /* Fixme: take from context.  */
+
+  descidx = ctx->descidx;
   if (descidx >= ndesc)
     {
       err = gpg_error (GPG_ERR_EOF);
@@ -672,8 +861,17 @@ run_select_statement (be_sqlite_local_t ctx,
       sqlite3_finalize (ctx->select_stmt);
       ctx->select_stmt = NULL;
     }
+  else if (ctx->filter_opgp != ctrl->filter_opgp
+           || ctx->filter_x509 != ctrl->filter_x509)
+    {
+      /* The filter flags changed, thus we can't reuse the statement.  */
+      sqlite3_finalize (ctx->select_stmt);
+      ctx->select_stmt = NULL;
+    }
 
   ctx->select_mode = desc[descidx].mode;
+  ctx->filter_opgp = ctrl->filter_opgp;
+  ctx->filter_x509 = ctrl->filter_x509;
 
   /* Prepare the select and bind the parameters.  */
   if (ctx->select_stmt)
@@ -683,8 +881,19 @@ run_select_statement (be_sqlite_local_t ctx,
         goto leave;
     }
   else
-    err = 0;
+    {
+      if (ctx->filter_opgp && ctx->filter_x509)
+        extra = " AND ( p.type = 1 OR p.type = 2 )";
+      else if (ctx->filter_opgp && !ctx->filter_x509)
+        extra = " AND p.type = 1";
+      else if (!ctx->filter_opgp && ctx->filter_x509)
+        extra = " AND p.type = 2";
 
+      err = 0;
+    }
+
+
+  ctx->select_col_uidno = ctx->select_col_subkey = 0;
   switch (desc[descidx].mode)
     {
     case KEYDB_SEARCH_MODE_NONE:
@@ -693,42 +902,49 @@ run_select_statement (be_sqlite_local_t ctx,
       break;
 
     case KEYDB_SEARCH_MODE_EXACT:
+      ctx->select_col_uidno = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob, u.uidno"
                                " FROM pubkey as p, userid as u"
-                               " WHERE u.uid = ?1",
-                               &ctx->select_stmt);
+                               " WHERE p.ubid = u.ubid AND u.uid = ?1",
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_text (ctx->select_stmt, 1, desc[descidx].u.name);
       break;
-
     case KEYDB_SEARCH_MODE_MAIL:
+      ctx->select_col_uidno = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob, u.uidno"
                                " FROM pubkey as p, userid as u"
-                               " WHERE u.addrspec = ?1",
-                               &ctx->select_stmt);
+                               " WHERE p.ubid = u.ubid AND u.addrspec = ?1",
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_text (ctx->select_stmt, 1, desc[descidx].u.name);
       break;
 
     case KEYDB_SEARCH_MODE_MAILSUB:
+      ctx->select_col_uidno = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob, u.uidno"
                                " FROM pubkey as p, userid as u"
-                               " WHERE u.addrspec LIKE ?1",
-                               &ctx->select_stmt);
+                               " WHERE p.ubid = u.ubid AND u.addrspec LIKE ?1",
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_text_like (ctx->select_stmt, 1,
                                       desc[descidx].u.name);
       break;
 
     case KEYDB_SEARCH_MODE_SUBSTR:
+      ctx->select_col_uidno = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob, u.uidno"
                                " FROM pubkey as p, userid as u"
-                               " WHERE u.uid LIKE ?1",
-                               &ctx->select_stmt);
+                               " WHERE p.ubid = u.ubid AND u.uid LIKE ?1",
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_text_like (ctx->select_stmt, 1,
                                       desc[descidx].u.name);
@@ -740,65 +956,114 @@ run_select_statement (be_sqlite_local_t ctx,
       break;
 
     case KEYDB_SEARCH_MODE_ISSUER:
-      err = gpg_error (GPG_ERR_NOT_IMPLEMENTED);  /* FIXME */
-      /* if (has_issuer (blob, desc[n].u.name)) */
-      /*   goto found; */
+      if (!ctx->select_stmt)
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob"
+                               " FROM pubkey as p, issuer as i"
+                               " WHERE p.ubid = i.ubid"
+                               " AND i.dn = $1",
+                               extra, &ctx->select_stmt);
+      if (!err)
+        err = run_sql_bind_text (ctx->select_stmt, 1,
+                                 desc[descidx].u.name);
       break;
 
     case KEYDB_SEARCH_MODE_ISSUER_SN:
-      err = gpg_error (GPG_ERR_NOT_IMPLEMENTED);  /* FIXME */
-      /* if (has_issuer_sn (blob, desc[n].u.name, */
-      /*                    sn_array? sn_array[n].sn : desc[n].sn, */
-      /*                    sn_array? sn_array[n].snlen : desc[n].snlen)) */
-      /*   goto found; */
+      if (!desc[descidx].snhex)
+        {
+          /* We should never get a binary S/N here.  */
+          log_debug ("%s: issuer_sn with binary s/n\n", __func__);
+          err = gpg_error (GPG_ERR_INTERNAL);
+        }
+      else
+        {
+          if (!ctx->select_stmt)
+            err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral,"
+                                   " p.revoked, p.keyblob"
+                                   " FROM pubkey as p, issuer as i"
+                                   " WHERE p.ubid = i.ubid"
+                                   " AND i.sn = $1 AND i.dn = $2",
+                                   extra, &ctx->select_stmt);
+          if (!err)
+            err = run_sql_bind_ntext (ctx->select_stmt, 1,
+                                      desc[descidx].sn, desc[descidx].snlen);
+          if (!err)
+            err = run_sql_bind_text (ctx->select_stmt, 2,
+                                     desc[descidx].u.name);
+        }
       break;
+
     case KEYDB_SEARCH_MODE_SN:
       err = gpg_error (GPG_ERR_NOT_IMPLEMENTED);  /* FIXME */
       /* if (has_sn (blob, sn_array? sn_array[n].sn : desc[n].sn, */
       /*             sn_array? sn_array[n].snlen : desc[n].snlen)) */
       /*   goto found; */
       break;
+
     case KEYDB_SEARCH_MODE_SUBJECT:
-      err = gpg_error (GPG_ERR_NOT_IMPLEMENTED);  /* FIXME */
-      /* if (has_subject (blob, desc[n].u.name)) */
-      /*   goto found; */
+      ctx->select_col_uidno = 5;
+      if (!ctx->select_stmt)
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob, u.uidno"
+                               " FROM pubkey as p, userid as u"
+                               " WHERE p.ubid = u.ubid"
+                               " AND u.uid = $1",
+                               extra, &ctx->select_stmt);
+      if (!err)
+        err = run_sql_bind_text (ctx->select_stmt, 1,
+                                 desc[descidx].u.name);
       break;
 
     case KEYDB_SEARCH_MODE_SHORT_KID:
-      err = gpg_error (GPG_ERR_NOT_IMPLEMENTED);  /* FIXME */
-      /* pk_no = has_short_kid (blob, desc[n].u.kid[1]); */
-      /* if (pk_no) */
-      /*   goto found; */
+      ctx->select_col_subkey = 5;
+      if (!ctx->select_stmt)
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral,"
+                               " p.revoked, p.keyblob, f.subkey"
+                               " FROM pubkey as p, fingerprint as f"
+                               " WHERE p.ubid = f.ubid AND"
+                               " substr(f.kid,5) = ?1",
+                               extra, &ctx->select_stmt);
+      if (!err)
+        err = run_sql_bind_blob (ctx->select_stmt, 1,
+                                 kid_from_u32 (desc[descidx].u.kid, kidbuf)+4,
+                                 4);
       break;
 
     case KEYDB_SEARCH_MODE_LONG_KID:
+      ctx->select_col_subkey = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral,"
+                               " p.revoked, p.keyblob, f.subkey"
                                " FROM pubkey as p, fingerprint as f"
                                " WHERE p.ubid = f.ubid AND f.kid = ?1",
-                               &ctx->select_stmt);
+                               extra, &ctx->select_stmt);
       if (!err)
-        err = run_sql_bind_int64 (ctx->select_stmt, 1,
-                                  kid_from_u32 (desc[descidx].u.kid));
+        err = run_sql_bind_blob (ctx->select_stmt, 1,
+                                 kid_from_u32 (desc[descidx].u.kid, kidbuf),
+                                 8);
       break;
 
     case KEYDB_SEARCH_MODE_FPR:
+      ctx->select_col_subkey = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral,"
+                               " p.revoked, p.keyblob, f.subkey"
                                " FROM pubkey as p, fingerprint as f"
                                " WHERE p.ubid = f.ubid AND f.fpr = ?1",
-                               &ctx->select_stmt);
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_blob (ctx->select_stmt, 1,
                                  desc[descidx].u.fpr, desc[descidx].fprlen);
       break;
 
     case KEYDB_SEARCH_MODE_KEYGRIP:
+      ctx->select_col_subkey = 5;
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT p.ubid, p.type, p.keyblob"
+        err = run_sql_prepare ("SELECT p.ubid, p.type, p.ephemeral, p.revoked,"
+                               " p.keyblob, f.subkey"
                                " FROM pubkey as p, fingerprint as f"
                                " WHERE p.ubid = f.ubid AND f.keygrip = ?1",
-                               &ctx->select_stmt);
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_blob (ctx->select_stmt, 1,
                                  desc[descidx].u.grip, KEYGRIP_LEN);
@@ -806,10 +1071,10 @@ run_select_statement (be_sqlite_local_t ctx,
 
     case KEYDB_SEARCH_MODE_UBID:
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT ubid, type, keyblob"
-                               " FROM pubkey"
+        err = run_sql_prepare ("SELECT ubid, type, ephemeral, revoked, keyblob"
+                               " FROM pubkey as p"
                                " WHERE ubid = ?1",
-                               &ctx->select_stmt);
+                               extra, &ctx->select_stmt);
       if (!err)
         err = run_sql_bind_blob (ctx->select_stmt, 1,
                                  desc[descidx].u.ubid, UBID_LEN);
@@ -817,9 +1082,21 @@ run_select_statement (be_sqlite_local_t ctx,
 
     case KEYDB_SEARCH_MODE_FIRST:
       if (!ctx->select_stmt)
-        err = run_sql_prepare ("SELECT ubid, type, keyblob"
-                               " FROM pubkey ORDER by ubid",
-                               &ctx->select_stmt);
+        {
+          if (ctx->filter_opgp && ctx->filter_x509)
+            extra = " WHERE ( p.type = 1 OR p.type = 2 ) ORDER by ubid";
+          else if (ctx->filter_opgp && !ctx->filter_x509)
+            extra = " WHERE p.type = 1 ORDER by ubid";
+          else if (!ctx->filter_opgp && ctx->filter_x509)
+            extra = " WHERE p.type = 2 ORDER by ubid";
+          else
+            extra = " ORDER by ubid";
+
+          err = run_sql_prepare ("SELECT ubid, type, ephemeral, revoked,"
+                                 " keyblob"
+                                 " FROM pubkey as p",
+                                 extra, &ctx->select_stmt);
+        }
       break;
 
     case KEYDB_SEARCH_MODE_NEXT:
@@ -864,6 +1141,7 @@ be_sqlite_search (ctrl_t ctrl,
       /* Reset */
       ctx->select_done = 0;
       ctx->select_eof = 0;
+      ctx->descidx = 0;
       err = 0;
       goto leave;
     }
@@ -875,10 +1153,21 @@ be_sqlite_search (ctrl_t ctrl,
       goto leave;
     }
 
+  /* Start a global transaction if needed.  */
+  if (!opt.active_transaction && opt.in_transaction)
+    {
+      err = run_sql_statement ("begin transaction");
+      if (err)
+        goto leave;
+      opt.active_transaction = 1;
+    }
+
+
+ again:
   if (!ctx->select_done)
     {
       /* Initial search - run the select.  */
-      err = run_select_statement (ctx, desc, ndesc);
+      err = run_select_statement (ctrl, ctx, desc, ndesc);
       if (err)
         goto leave;
       ctx->select_done = 1;
@@ -894,6 +1183,8 @@ be_sqlite_search (ctrl_t ctrl,
       const void *ubid, *keyblob;
       size_t keybloblen;
       enum pubkey_types pubkey_type;
+      int is_ephemeral, is_revoked;
+      int pk_no, uid_no;
 
       ubid = sqlite3_column_blob (ctx->select_stmt, 0);
       n = sqlite3_column_bytes (ctx->select_stmt, 0);
@@ -926,8 +1217,30 @@ be_sqlite_search (ctrl_t ctrl,
         }
       pubkey_type = n;
 
-      keyblob = sqlite3_column_blob (ctx->select_stmt, 2);
-      n = sqlite3_column_bytes (ctx->select_stmt, 2);
+      n = sqlite3_column_int (ctx->select_stmt, 2);
+      if (!n && sqlite3_errcode (database_hd) == SQLITE_NOMEM)
+        {
+          err = gpg_error (gpg_err_code_from_sqlite (SQLITE_NOMEM));
+          show_sqlstmt (ctx->select_stmt);
+          log_error ("error in returned SQL column EPHEMERAL: %s)\n",
+                     gpg_strerror (err));
+          goto leave;
+        }
+      is_ephemeral = !!n;
+
+      n = sqlite3_column_int (ctx->select_stmt, 3);
+      if (!n && sqlite3_errcode (database_hd) == SQLITE_NOMEM)
+        {
+          err = gpg_error (gpg_err_code_from_sqlite (SQLITE_NOMEM));
+          show_sqlstmt (ctx->select_stmt);
+          log_error ("error in returned SQL column REVOKED: %s)\n",
+                     gpg_strerror (err));
+          goto leave;
+        }
+      is_revoked = !!n;
+
+      keyblob = sqlite3_column_blob (ctx->select_stmt, 4);
+      n = sqlite3_column_bytes (ctx->select_stmt, 4);
       if (!keyblob || n < 0)
         {
           if (!keyblob && sqlite3_errcode (database_hd) == SQLITE_NOMEM)
@@ -941,13 +1254,56 @@ be_sqlite_search (ctrl_t ctrl,
         }
       keybloblen = n;
 
-      err = be_return_pubkey (ctrl, keyblob, keybloblen, pubkey_type, ubid);
+      if (ctx->select_col_uidno)
+        {
+          n = sqlite3_column_int (ctx->select_stmt, ctx->select_col_uidno);
+          if (!n && sqlite3_errcode (database_hd) == SQLITE_NOMEM)
+            {
+              err = gpg_error (gpg_err_code_from_sqlite (SQLITE_NOMEM));
+              show_sqlstmt (ctx->select_stmt);
+              log_error ("error in returned SQL column UIDNO: %s)\n",
+                         gpg_strerror (err));
+              uid_no = 0;
+            }
+          else if (n < 0)
+            uid_no = 0;
+          else
+            uid_no = n + 1;
+        }
+      else
+        uid_no = 0;
+
+      if (ctx->select_col_subkey)
+        {
+          n = sqlite3_column_int (ctx->select_stmt, ctx->select_col_subkey);
+          if (!n && sqlite3_errcode (database_hd) == SQLITE_NOMEM)
+            {
+              err = gpg_error (gpg_err_code_from_sqlite (SQLITE_NOMEM));
+              show_sqlstmt (ctx->select_stmt);
+              log_error ("error in returned SQL column SUBKEY: %s)\n",
+                         gpg_strerror (err));
+              goto leave;
+            }
+          else if (n < 0)
+            pk_no = 0;
+          else
+            pk_no = n + 1;
+        }
+      else
+        pk_no = 0;
+
+      err = be_return_pubkey (ctrl, keyblob, keybloblen, pubkey_type,
+                              ubid, is_ephemeral, is_revoked, uid_no, pk_no);
       if (!err)
         be_cache_pubkey (ctrl, ubid, keyblob, keybloblen, pubkey_type);
     }
   else if (gpg_err_code (err) == GPG_ERR_SQL_DONE)
     {
-      /* FIXME: Move on to the next description index.  */
+      if (++ctx->descidx < ndesc)
+        {
+          ctx->select_done = 0;
+          goto again;
+        }
       err = gpg_error (GPG_ERR_EOF);
       ctx->select_eof = 1;
     }
@@ -975,13 +1331,13 @@ store_into_pubkey (enum kbxd_store_modes mode,
   sqlite3_stmt *stmt = NULL;
 
   if (mode == KBXD_STORE_UPDATE)
-    sqlstr = ("UPDATE pubkey set keyblob = :3, type = :2 WHERE ubid = :1");
+    sqlstr = ("UPDATE pubkey set keyblob = ?3, type = ?2 WHERE ubid = ?1");
   else if (mode == KBXD_STORE_INSERT)
-    sqlstr = ("INSERT INTO pubkey(ubid,type,keyblob) VALUES(:1,:2,:3)");
+    sqlstr = ("INSERT INTO pubkey(ubid,type,keyblob) VALUES(?1,?2,?3)");
   else /* Auto */
     sqlstr = ("INSERT OR REPLACE INTO pubkey(ubid,type,keyblob)"
-              " VALUES(:1,:2,:3)");
-  err = run_sql_prepare (sqlstr, &stmt);
+              " VALUES(?1,?2,?3)");
+  err = run_sql_prepare (sqlstr, NULL, &stmt);
   if (err)
     goto leave;
   err = run_sql_bind_blob (stmt, 1, ubid, UBID_LEN);
@@ -1007,7 +1363,8 @@ store_into_pubkey (enum kbxd_store_modes mode,
  * fingerprint table.  */
 static gpg_error_t
 store_into_fingerprint (const unsigned char *ubid, int subkey,
-                        const unsigned char *keygrip, sqlite3_int64 kid,
+                        const unsigned char *keygrip,
+                        const unsigned char *kid,
                         const unsigned char *fpr, int fprlen)
 {
   gpg_error_t err;
@@ -1015,14 +1372,14 @@ store_into_fingerprint (const unsigned char *ubid, int subkey,
   sqlite3_stmt *stmt = NULL;
 
   sqlstr = ("INSERT OR REPLACE INTO fingerprint(fpr,kid,keygrip,subkey,ubid)"
-            " VALUES(:1,:2,:3,:4,:5)");
-  err = run_sql_prepare (sqlstr, &stmt);
+            " VALUES(?1,?2,?3,?4,?5)");
+  err = run_sql_prepare (sqlstr, NULL, &stmt);
   if (err)
     goto leave;
   err = run_sql_bind_blob (stmt, 1, fpr, fprlen);
   if (err)
     goto leave;
-  err = run_sql_bind_int64 (stmt, 2, kid);
+  err = run_sql_bind_blob (stmt, 2, kid, 8);
   if (err)
     goto leave;
   err = run_sql_bind_blob (stmt, 3, keygrip, KEYGRIP_LEN);
@@ -1044,34 +1401,82 @@ store_into_fingerprint (const unsigned char *ubid, int subkey,
 }
 
 
-/* Helper for be_sqlite_store to update or insert a row in the
- * userid table.  */
+/* Helper for be_sqlite_store to update or insert a row in the userid
+ * table.  If OVERRIDE_MBOX is set, that value is used instead of a
+ * value extracted from UID. */
 static gpg_error_t
 store_into_userid (const unsigned char *ubid, enum pubkey_types pktype,
-                   const char *uid)
+                   const char *uid, int uidno, const char *override_mbox)
 {
   gpg_error_t err;
   const char *sqlstr;
   sqlite3_stmt *stmt = NULL;
   char *addrspec = NULL;
 
-  sqlstr = ("INSERT OR REPLACE INTO userid(uid,addrspec,type,ubid)"
-            " VALUES(:1,:2,:3,:4)");
-  err = run_sql_prepare (sqlstr, &stmt);
+  sqlstr = ("INSERT OR REPLACE INTO userid(uid,addrspec,type,ubid,uidno)"
+            " VALUES(?1,?2,?3,?4,?5)");
+  err = run_sql_prepare (sqlstr, NULL, &stmt);
   if (err)
     goto leave;
 
   err = run_sql_bind_text (stmt, 1, uid);
   if (err)
     goto leave;
-  addrspec = mailbox_from_userid (uid, 0);
-  err = run_sql_bind_text (stmt, 2, addrspec);
+
+  if (override_mbox)
+    err = run_sql_bind_text (stmt, 2, override_mbox);
+  else
+    {
+      addrspec = mailbox_from_userid (uid, 0);
+      err = run_sql_bind_text (stmt, 2, addrspec);
+    }
   if (err)
     goto leave;
+
   err = run_sql_bind_int (stmt, 3, pktype);
   if (err)
     goto leave;
   err = run_sql_bind_blob (stmt, 4, ubid, UBID_LEN);
+  if (err)
+    goto leave;
+  err = run_sql_bind_int (stmt, 5, uidno);
+  if (err)
+    goto leave;
+
+  err = run_sql_step (stmt);
+
+ leave:
+  if (stmt)
+    sqlite3_finalize (stmt);
+  xfree (addrspec);
+  return err;
+}
+
+
+/* Helper for be_sqlite_store to update or insert a row in the
+ * issuer table.  */
+static gpg_error_t
+store_into_issuer (const unsigned char *ubid,
+                   const char *sn, const char *issuer)
+{
+  gpg_error_t err;
+  const char *sqlstr;
+  sqlite3_stmt *stmt = NULL;
+  char *addrspec = NULL;
+
+  sqlstr = ("INSERT OR REPLACE INTO issuer(sn,dn,ubid)"
+            " VALUES(?1,?2,?3)");
+  err = run_sql_prepare (sqlstr, NULL, &stmt);
+  if (err)
+    goto leave;
+
+  err = run_sql_bind_text (stmt, 1, sn);
+  if (err)
+    goto leave;
+  err = run_sql_bind_text (stmt, 2, issuer);
+  if (err)
+    goto leave;
+  err = run_sql_bind_blob (stmt, 3, ubid, UBID_LEN);
   if (err)
     goto leave;
 
@@ -1102,7 +1507,11 @@ be_sqlite_store (ctrl_t ctrl, backend_handle_t backend_hd,
   int in_transaction = 0;
   int info_valid = 0;
   struct _keybox_openpgp_info info;
-  struct _keybox_openpgp_key_info *kinfo;
+  ksba_cert_t cert = NULL;
+  char *sn = NULL;
+  char *dn = NULL;
+  char *kludge_mbox = NULL;
+  int uidno;
 
   (void)ctrl;
 
@@ -1115,10 +1524,14 @@ be_sqlite_store (ctrl_t ctrl, backend_handle_t backend_hd,
 
   if (be_is_x509_blob (blob, bloblen))
     {
-      /* The UBID is also our fingerprint.  */
-      /* FIXME: Extract keygrip and KID.  */
-      err = gpg_error (GPG_ERR_NOT_IMPLEMENTED);
-      goto leave;
+      log_assert (pktype == PUBKEY_TYPE_X509);
+
+      err = ksba_cert_new (&cert);
+      if (err)
+        goto leave;
+      err = ksba_cert_init_from_mem (cert, blob, bloblen);
+      if (err)
+        goto leave;
     }
   else
     {
@@ -1145,9 +1558,14 @@ be_sqlite_store (ctrl_t ctrl, backend_handle_t backend_hd,
     goto leave;
   /* ctx = part->besqlite; */
 
-  err = run_sql_statement ("begin transaction");
-  if (err)
-    goto leave;
+  if (!opt.active_transaction)
+    {
+      err = run_sql_statement ("begin transaction");
+      if (err)
+        goto leave;
+      if (opt.in_transaction)
+        opt.active_transaction = 1;
+    }
   in_transaction = 1;
 
   err = store_into_pubkey (mode, pktype, ubid, blob, bloblen);
@@ -1157,77 +1575,162 @@ be_sqlite_store (ctrl_t ctrl, backend_handle_t backend_hd,
   /* Delete all related rows so that we can freshly add possibly added
    * or changed user ids and subkeys.  */
   err = run_sql_statement_bind_ubid
-    ("DELETE FROM fingerprint WHERE ubid = :1", ubid);
+    ("DELETE FROM fingerprint WHERE ubid = ?1", ubid);
   if (err)
     goto leave;
   err = run_sql_statement_bind_ubid
-    ("DELETE FROM userid WHERE ubid = :1", ubid);
+    ("DELETE FROM userid WHERE ubid = ?1", ubid);
   if (err)
     goto leave;
-
-  kinfo = &info.primary;
-  err = store_into_fingerprint (ubid, 0, kinfo->grip,
-                                kid_from_mem (kinfo->keyid),
-                                kinfo->fpr, kinfo->fprlen);
-  if (err)
-    goto leave;
-
-  if (info.nsubkeys)
+  if (cert)
     {
-      int subkey = 1;
-      for (kinfo = &info.subkeys; kinfo; kinfo = kinfo->next, subkey++)
-        {
-          err = store_into_fingerprint (ubid, subkey, kinfo->grip,
-                                        kid_from_mem (kinfo->keyid),
-                                        kinfo->fpr, kinfo->fprlen);
-          if (err)
-            goto leave;
-        }
+      err = run_sql_statement_bind_ubid
+        ("DELETE FROM issuer WHERE ubid = ?1", ubid);
+      if (err)
+        goto leave;
     }
 
-  if (info.nuids)
+  if (cert)  /* X.509 */
     {
-      struct _keybox_openpgp_uid_info *u;
+      unsigned char grip[KEYGRIP_LEN];
+      int idx;
 
-      u = &info.uids;
-      do
+      err = be_get_x509_keygrip (cert, grip);
+      if (err)
+        goto leave;
+
+      /* Note that for X.509 the UBID is also the fingerprint.  */
+      err = store_into_fingerprint (ubid, 0, grip,
+                                    ubid+12,
+                                    ubid, UBID_LEN);
+      if (err)
+        goto leave;
+
+      /* Now the issuer.  */
+      sn = be_get_x509_serial (cert);
+      if (!sn)
         {
-          log_assert (u->off <= bloblen);
-          log_assert (u->off + u->len <= bloblen);
-          {
-            char *uid = xtrymalloc (u->len + 1);
-            if (!uid)
-              {
-                err = gpg_error_from_syserror ();
-                goto leave;
-              }
-            memcpy (uid, (const unsigned char *)blob + u->off, u->len);
-            uid[u->len] = 0;
-            /* Note that we ignore embedded zeros in the user id; this
-             * is what we do all over the place.  */
-            err = store_into_userid (ubid, pktype, uid);
-            xfree (uid);
-          }
+          err = gpg_error_from_syserror ();
+          goto leave;
+        }
+      dn = ksba_cert_get_issuer (cert, 0);
+      if (!dn)
+        {
+          err = gpg_error_from_syserror ();
+          goto leave;
+        }
+      err = store_into_issuer (ubid, sn, dn);
+      if (err)
+        goto leave;
+
+      /* Loop over the subject and alternate subjects. */
+      uidno = 0;
+      for (idx=0; (xfree (dn), dn = ksba_cert_get_subject (cert, idx)); idx++)
+        {
+          /* In the case that the same email address is in the
+           * subject DN as well as in an alternate subject name
+           * we avoid printing it a second time. */
+          if (kludge_mbox && !strcmp (kludge_mbox, dn))
+            continue;
+
+          err = store_into_userid (ubid, PUBKEY_TYPE_X509, dn, ++uidno, NULL);
           if (err)
             goto leave;
 
-          u = u->next;
+          if (!idx)
+            {
+              kludge_mbox = _keybox_x509_email_kludge (dn);
+              if (kludge_mbox)
+                {
+                  err = store_into_userid (ubid, PUBKEY_TYPE_X509,
+                                           dn, ++uidno, kludge_mbox);
+                  if (err)
+                    goto leave;
+                }
+            }
+        } /* end loop over the subjects.  */
+    }
+  else /* OpenPGP */
+    {
+      struct _keybox_openpgp_key_info *kinfo;
+
+      kinfo = &info.primary;
+      err = store_into_fingerprint (ubid, 0, kinfo->grip,
+                                    kinfo->keyid,
+                                    kinfo->fpr, kinfo->fprlen);
+      if (err)
+        goto leave;
+
+      if (info.nsubkeys)
+        {
+          int subkey = 1;
+          for (kinfo = &info.subkeys; kinfo; kinfo = kinfo->next, subkey++)
+            {
+              err = store_into_fingerprint (ubid, subkey, kinfo->grip,
+                                            kinfo->keyid,
+                                            kinfo->fpr, kinfo->fprlen);
+              if (err)
+                goto leave;
+            }
         }
-      while (u);
+
+      if (info.nuids)
+        {
+          struct _keybox_openpgp_uid_info *u;
+
+          uidno = 0;
+          u = &info.uids;
+          do
+            {
+              log_assert (u->off <= bloblen);
+              log_assert (u->off + u->len <= bloblen);
+              {
+                char *uid = xtrymalloc (u->len + 1);
+                if (!uid)
+                  {
+                    err = gpg_error_from_syserror ();
+                    goto leave;
+                  }
+                memcpy (uid, (const unsigned char *)blob + u->off, u->len);
+                uid[u->len] = 0;
+                /* Note that we ignore embedded zeros in the user id;
+                 * this is what we do all over the place.  */
+                err = store_into_userid (ubid, pktype, uid, ++uidno, NULL);
+                xfree (uid);
+              }
+              if (err)
+                goto leave;
+
+              u = u->next;
+            }
+          while (u);
+        }
     }
 
  leave:
   if (in_transaction && !err)
-    err = run_sql_statement ("commit");
+    {
+      if (opt.active_transaction)
+        ; /* We are in a global transaction.  */
+      else
+        err = run_sql_statement ("commit");
+    }
   else if (in_transaction)
     {
-      if (run_sql_statement ("rollback"))
+      if (opt.active_transaction)
+        ; /* We are in a global transaction.  */
+      else if (run_sql_statement ("rollback"))
         log_error ("Warning: database rollback failed - should not happen!\n");
     }
   if (got_mutex)
     release_mutex ();
   if (info_valid)
     _keybox_destroy_openpgp_info (&info);
+  if (cert)
+    ksba_cert_release (cert);
+  ksba_free (dn);
+  xfree (sn);
+  xfree (kludge_mbox);
   return err;
 }
 
@@ -1258,29 +1761,45 @@ be_sqlite_delete (ctrl_t ctrl, backend_handle_t backend_hd,
     goto leave;
   /* ctx = part->besqlite; */
 
-  err = run_sql_statement ("begin transaction");
-  if (err)
-    goto leave;
+  if (!opt.active_transaction)
+    {
+      err = run_sql_statement ("begin transaction");
+      if (err)
+        goto leave;
+      if (opt.in_transaction)
+        opt.active_transaction = 1;
+    }
   in_transaction = 1;
 
   err = run_sql_statement_bind_ubid
-    ("DELETE from userid WHERE ubid = :1", ubid);
+    ("DELETE from userid WHERE ubid = ?1", ubid);
   if (!err)
     err = run_sql_statement_bind_ubid
-      ("DELETE from fingerprint WHERE ubid = :1", ubid);
+      ("DELETE from fingerprint WHERE ubid = ?1", ubid);
   if (!err)
     err = run_sql_statement_bind_ubid
-      ("DELETE from pubkey WHERE ubid = :1", ubid);
+      ("DELETE from issuer WHERE ubid = ?1", ubid);
+  if (!err)
+    err = run_sql_statement_bind_ubid
+      ("DELETE from pubkey WHERE ubid = ?1", ubid);
 
 
  leave:
   if (stmt)
     sqlite3_finalize (stmt);
+
   if (in_transaction && !err)
-    err = run_sql_statement ("commit");
+    {
+      if (opt.active_transaction)
+        ; /* We are in a global transaction.  */
+      else
+        err = run_sql_statement ("commit");
+    }
   else if (in_transaction)
     {
-      if (run_sql_statement ("rollback"))
+      if (opt.active_transaction)
+        ; /* We are in a global transaction.  */
+      else if (run_sql_statement ("rollback"))
         log_error ("Warning: database rollback failed - should not happen!\n");
     }
   release_mutex ();

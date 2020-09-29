@@ -121,6 +121,7 @@ static struct {
   { 0x00D7, 0, 0x6E, 1, 0, 0, 0, 0, "UIF for Decryption"},
   { 0x00D8, 0, 0x6E, 1, 0, 0, 0, 0, "UIF for Authentication"},
   { 0x00F9, 0,    0, 1, 0, 0, 0, 0, "KDF data object"},
+  { 0x00FA, 0,    0, 1, 0, 0, 0, 2, "Algorithm Information"},
   { 0 }
 };
 
@@ -272,6 +273,8 @@ static gpg_error_t do_auth (app_t app, ctrl_t ctrl, const char *keyidstr,
                             void *pincb_arg,
                             const void *indata, size_t indatalen,
                             unsigned char **outdata, size_t *outdatalen);
+static const char *get_algorithm_attribute_string (const unsigned char *buffer,
+                                                   size_t buflen);
 static void parse_algorithm_attribute (app_t app, int keyno);
 static gpg_error_t change_keyattr_from_string
                            (app_t app, ctrl_t ctrl,
@@ -1082,6 +1085,9 @@ do_getattr (app_t app, ctrl_t ctrl, const char *name)
     { "UIF-3",        0x00D8, 0 },
     { "KDF",          0x00F9, 5 },
     { "MANUFACTURER", 0x0000, -8 },
+    { "UIF",          0x0000, -9 },  /* Shortcut for all UIF */
+    { "KEY-STATUS",   0x00DE,  6 },
+    { "KEY-ATTR-INFO", 0x00FA,  7 },
     { NULL, 0 }
   };
   int idx, i, rc;
@@ -1180,6 +1186,15 @@ do_getattr (app_t app, ctrl_t ctrl, const char *name)
          app->app_local->manufacturer,
          get_manufacturer (app->app_local->manufacturer));
     }
+  if (table[idx].special == -9)
+    {
+      rc = do_getattr (app, ctrl, "UIF-1");
+      if (!rc)
+        rc = do_getattr (app, ctrl, "UIF-2");
+      if (!rc)
+        rc = do_getattr (app, ctrl, "UIF-3");
+      return rc;
+    }
 
   relptr = get_one_do (app, table[idx].tag, &value, &valuelen, &rc);
   if (relptr)
@@ -1223,6 +1238,86 @@ do_getattr (app_t app, ctrl_t ctrl, const char *name)
             app->app_local->pinpad.disabled = 0;
 
           send_status_info (ctrl, table[idx].name, value, valuelen, NULL, 0);
+        }
+      else if (table[idx].special == 6)
+        {
+          for (i=0,rc=0; !rc && i+1 < valuelen; i += 2)
+            rc = send_status_printf (ctrl, table[idx].name, "OPENPGP.%u %u",
+                                     value[i], value[i+1]);
+          if (gpg_err_code (rc) == GPG_ERR_NO_OBJ)
+            rc = gpg_error (GPG_ERR_NOT_SUPPORTED);
+        }
+      else if (table[idx].special == 7)
+        {
+          const unsigned char *p = value;
+          int tag;
+          size_t len;
+
+          if (valuelen < 2)
+            return gpg_error (GPG_ERR_INV_OBJ);
+
+          tag = p[0];
+          len = p[1];
+
+          /* Does it comes tag+len at the head?  */
+          if (tag == 0x00FA)
+            {
+              p += 2;
+
+              if (len == 0x81)
+                {
+                  if (valuelen < 3)
+                    return gpg_error (GPG_ERR_INV_OBJ);
+                  len = *p++;
+                }
+              else if (len == 0x82)
+                {
+                  if (valuelen < 4)
+                    return gpg_error (GPG_ERR_INV_OBJ);
+                  len = *p++;
+                  len = (len << 8) | *p++;
+                }
+
+              valuelen -= (p - value);
+              value = (unsigned char *)p;
+
+              if (valuelen != len)
+                {
+                  if (opt.verbose)
+                    log_info ("Yubikey bug: length %zu != %zu", valuelen, len);
+
+                  if (app->card->cardtype != CARDTYPE_YUBIKEY)
+                    return gpg_error (GPG_ERR_INV_OBJ);
+                }
+            }
+
+          for (; p < value + valuelen; p += len)
+            {
+              const char *key_algo_str;
+              int keyrefno;
+
+              if (p + 2 > value + valuelen)
+                break;
+
+              tag = *p++;
+              len = *p++;
+
+              if (tag < 0xc1)
+                continue;
+
+              if (tag == 0xda)
+                keyrefno = 0x81;
+              else
+                keyrefno = tag - 0xc1 + 1;
+
+              if (p + len > value + valuelen)
+                break;
+
+              key_algo_str = get_algorithm_attribute_string (p, len);
+
+              send_status_printf (ctrl, table[idx].name, "OPENPGP.%u %s",
+                                  keyrefno, key_algo_str);
+            }
         }
       else
         send_status_info (ctrl, table[idx].name, value, valuelen, NULL, 0);
@@ -1848,6 +1943,9 @@ get_public_key (app_t app, int keyno)
                                      2, le_value, &buffer, &buflen);
       if (err)
         {
+          /* Yubikey returns wrong code.  Fix it up.  */
+          if (app->card->cardtype == CARDTYPE_YUBIKEY)
+            err = gpg_error (GPG_ERR_NO_OBJ);
           log_error (_("reading public key failed: %s\n"), gpg_strerror (err));
           goto leave;
         }
@@ -1951,6 +2049,7 @@ send_keypair_info (app_t app, ctrl_t ctrl, int key)
   gpg_error_t err = 0;
   const char *usage;
   u32 fprtime;
+  char *algostr = NULL;
 
   err = get_public_key (app, keyno);
   if (err)
@@ -1971,11 +2070,29 @@ send_keypair_info (app_t app, ctrl_t ctrl, int key)
   if (retrieve_fprtime_from_card (app, keyno, &fprtime))
     fprtime = 0;
 
-  err = send_status_printf (ctrl, "KEYPAIRINFO", "%s OPENPGP.%d %s %lu",
+  {
+    gcry_sexp_t s_pkey;
+    if (gcry_sexp_new (&s_pkey, app->app_local->pk[keyno].key,
+                       app->app_local->pk[keyno].keylen, 0))
+      algostr = xtrystrdup ("?");
+    else
+      {
+        algostr = pubkey_algo_string (s_pkey, NULL);
+        gcry_sexp_release (s_pkey);
+      }
+  }
+  if (!algostr)
+    {
+      err = gpg_error_from_syserror ();
+      goto leave;
+    }
+
+  err = send_status_printf (ctrl, "KEYPAIRINFO", "%s OPENPGP.%d %s %lu %s",
                             app->app_local->pk[keyno].keygrip_str,
-                            keyno+1, usage, (unsigned long)fprtime);
+                            keyno+1, usage, (unsigned long)fprtime, algostr);
 
  leave:
+  xfree (algostr);
   return err;
 }
 
@@ -2002,11 +2119,7 @@ do_learn_status (app_t app, ctrl_t ctrl, unsigned int flags)
   if (app->app_local->extcap.kdf_do)
     do_getattr (app, ctrl, "KDF");
   if (app->app_local->extcap.has_button)
-    {
-      do_getattr (app, ctrl, "UIF-1");
-      do_getattr (app, ctrl, "UIF-2");
-      do_getattr (app, ctrl, "UIF-3");
-    }
+    do_getattr (app, ctrl, "UIF");
   if (app->app_local->extcap.private_dos)
     {
       do_getattr (app, ctrl, "PRIVATE-DO-1");
@@ -2550,32 +2663,41 @@ verify_chv2 (app_t app, ctrl_t ctrl,
   if (app->did_chv2)
     return 0;  /* We already verified CHV2.  */
 
-  rc = verify_a_chv (app, ctrl, pincb, pincb_arg, 2, 0, &pinvalue, &pinlen);
-  if (rc)
-    return rc;
-  app->did_chv2 = 1;
-
-  if (!app->did_chv1 && !app->force_chv1 && pinvalue)
+  if (app->app_local->pk[1].key || app->app_local->pk[2].key)
     {
-      /* For convenience we verify CHV1 here too.  We do this only if
-         the card is not configured to require a verification before
-         each CHV1 controlled operation (force_chv1) and if we are not
-         using the pinpad (PINVALUE == NULL). */
-      rc = iso7816_verify (app_get_slot (app), 0x81, pinvalue, pinlen);
-      if (gpg_err_code (rc) == GPG_ERR_BAD_PIN)
-        rc = gpg_error (GPG_ERR_PIN_NOT_SYNCED);
+      rc = verify_a_chv (app, ctrl, pincb, pincb_arg, 2, 0, &pinvalue, &pinlen);
       if (rc)
+        return rc;
+      app->did_chv2 = 1;
+
+      if (!app->did_chv1 && !app->force_chv1 && pinvalue)
         {
-          log_error (_("verify CHV%d failed: %s\n"), 1, gpg_strerror (rc));
-          flush_cache_after_error (app);
+          /* For convenience we verify CHV1 here too.  We do this only if
+             the card is not configured to require a verification before
+             each CHV1 controlled operation (force_chv1) and if we are not
+             using the pinpad (PINVALUE == NULL). */
+          rc = iso7816_verify (app_get_slot (app), 0x81, pinvalue, pinlen);
+          if (gpg_err_code (rc) == GPG_ERR_BAD_PIN)
+            rc = gpg_error (GPG_ERR_PIN_NOT_SYNCED);
+          if (rc)
+            {
+              log_error (_("verify CHV%d failed: %s\n"), 1, gpg_strerror (rc));
+              flush_cache_after_error (app);
+            }
+          else
+            {
+              app->did_chv1 = 1;
+              /* Note that we are not able to cache the CHV 1 here because
+               * it is possible that due to the use of a KDF-DO PINVALUE
+               * has the hashed binary PIN of length PINLEN.  */
+            }
         }
-      else
-        {
-          app->did_chv1 = 1;
-          /* Note that we are not able to cache the CHV 1 here because
-           * it is possible that due to the use of a KDF-DO PINVALUE
-           * has the hashed binary PIN of length PINLEN.  */
-        }
+    }
+  else
+    {
+      rc = verify_a_chv (app, ctrl, pincb, pincb_arg, 1, 0, &pinvalue, &pinlen);
+      if (rc)
+        return rc;
     }
 
   wipe_and_free (pinvalue, pinlen);
@@ -2815,22 +2937,47 @@ do_setattr (app_t app, ctrl_t ctrl, const char *name,
 
   if (table[idx].special == 4)
     {
-      if (valuelen == KDF_DATA_LENGTH_MIN)
+      if (app->card->cardtype == CARDTYPE_YUBIKEY
+          || app->card->cardtype == CARDTYPE_GNUK)
         {
-          /* Single user KDF of Gnuk */
           rc = verify_chv3 (app, ctrl, pincb, pincb_arg);
           if (rc)
             return rc;
+
+          if (valuelen == 3
+              && app->card->cardtype == CARDTYPE_GNUK)
+            {
+              value = NULL;
+              valuelen = 0;
+            }
+
+          cache_pin (app, ctrl, 1, NULL);
+          cache_pin (app, ctrl, 2, NULL);
+          cache_pin (app, ctrl, 3, NULL);
         }
-      else if (valuelen == KDF_DATA_LENGTH_MAX)
+      else
         {
           char *oldpinvalue = NULL;
           char *buffer1 = NULL;
           size_t bufferlen1;
           const char *u, *a;
+          size_t ulen, alen;
 
-          u = (const char *)value + 44;
-          a = u + 34;
+          if (valuelen == 3)
+            {
+              u = "123456";
+              a = "12345678";
+              ulen = 6;
+              alen = 8;
+            }
+          else if (valuelen == KDF_DATA_LENGTH_MAX)
+            {
+              u = (const char *)value + 44;
+              a = u + 34;
+              ulen = alen = 32;
+            }
+          else
+            return gpg_error (GPG_ERR_INV_OBJ);
 
           if (!pin_from_cache (app, ctrl, 3, &oldpinvalue))
             {
@@ -2854,28 +3001,26 @@ do_setattr (app_t app, ctrl_t ctrl, const char *name,
             rc = iso7816_change_reference_data (app_get_slot (app),
                                                 0x83,
                                                 buffer1, bufferlen1,
-                                                a, 32);
+                                                a, alen);
           if (!rc)
-            rc = iso7816_verify (app_get_slot (app), 0x83, a, 32);
+            rc = iso7816_verify (app_get_slot (app), 0x83, a, alen);
           if (!rc)
             cache_pin (app, ctrl, 3, "12345678");
 
           if (!rc)
-            rc = iso7816_reset_retry_counter (app_get_slot (app), 0x81, u, 32);
+            rc = iso7816_reset_retry_counter (app_get_slot (app), 0x81, u, ulen);
           if (!rc)
             cache_pin (app, ctrl, 1, "123456");
 
           if (!rc)
             rc = iso7816_put_data (app_get_slot (app), 0, 0xD3, NULL, 0);
 
-          /* Flush the cache again, because pin2hash_if_kdf uses the DO.  */
-          flush_cache_item (app, 0xF9);
-
           wipe_and_free (buffer1, bufferlen1);
           wipe_and_free_string (oldpinvalue);
         }
-      else
-        return gpg_error (GPG_ERR_INV_OBJ);
+
+      /* Flush the cache again, because pin2hash_if_kdf uses the DO.  */
+      flush_cache_item (app, 0x00F9);
     }
 
   rc = iso7816_put_data (app_get_slot (app),
@@ -3199,7 +3344,7 @@ do_change_pin (app_t app, ctrl_t ctrl,  const char *chvnostr,
       char *result1 = NULL;
       char *result2 = NULL;
       char *buffer = NULL;
-      size_t resultlen1, resultlen2, bufferlen=0;
+      size_t resultlen1, resultlen2=0, bufferlen=0;
 
       rc = pin2hash_if_kdf (app, 0, resetcode, &result1, &resultlen1);
       if (!rc)
@@ -3225,9 +3370,6 @@ do_change_pin (app_t app, ctrl_t ctrl,  const char *chvnostr,
     }
   else if (set_resetcode)
     {
-      char *buffer = NULL;
-      size_t bufferlen;
-
       if (strlen (pinvalue) < 8)
         {
           log_error (_("Reset Code is too short; minimum length is %d\n"), 8);
@@ -3235,13 +3377,16 @@ do_change_pin (app_t app, ctrl_t ctrl,  const char *chvnostr,
         }
       else
         {
+          char *buffer = NULL;
+          size_t bufferlen;
+
           rc = pin2hash_if_kdf (app, 0, pinvalue, &buffer, &bufferlen);
           if (!rc)
             rc = iso7816_put_data (app_get_slot (app),
                                    0, 0xD3, buffer, bufferlen);
-        }
 
-      wipe_and_free (buffer, bufferlen);
+          wipe_and_free (buffer, bufferlen);
+        }
     }
   else if (reset_mode)
     {
@@ -3304,7 +3449,7 @@ do_change_pin (app_t app, ctrl_t ctrl,  const char *chvnostr,
         {
           char *buffer1 = NULL;
           char *buffer2 = NULL;
-          size_t bufferlen1, bufferlen2;
+          size_t bufferlen1, bufferlen2 = 0;
 
           rc = pin2hash_if_kdf (app, chvno, oldpinvalue, &buffer1, &bufferlen1);
           if (!rc)
@@ -3558,11 +3703,11 @@ build_ecc_privkey_template (app_t app, int keyno,
                             const unsigned char *ecc_q, size_t ecc_q_len,
                             unsigned char **result, size_t *resultlen)
 {
-  unsigned char privkey[2+2];
+  unsigned char privkey[2*(1+3)];
   size_t privkey_len;
-  unsigned char exthdr[2+2+1];
+  unsigned char exthdr[2+2+3];
   size_t exthdr_len;
-  unsigned char suffix[2+1];
+  unsigned char suffix[2+3];
   size_t suffix_len;
   unsigned char *tp;
   size_t datalen;
@@ -3641,7 +3786,7 @@ build_ecc_privkey_template (app_t app, int keyno,
 }
 
 
-/* Helper for do_writekley to change the size of a key.  Not ethat
+/* Helper for do_writekey to change the size of a key.  Not ethat
    this deletes the entire key without asking.  */
 static gpg_error_t
 change_keyattr (app_t app, ctrl_t ctrl,
@@ -3670,6 +3815,9 @@ change_keyattr (app_t app, ctrl_t ctrl,
   app->did_chv1 = 0;
   app->did_chv2 = 0;
   app->did_chv3 = 0;
+  cache_pin (app, ctrl, 1, NULL);
+  cache_pin (app, ctrl, 2, NULL);
+  cache_pin (app, ctrl, 3, NULL);
   return err;
 }
 
@@ -4748,7 +4896,7 @@ compare_fingerprint (app_t app, int keyno, unsigned char *sha1fpr)
       return gpg_error (GPG_ERR_GENERAL);
     }
   fpr = find_tlv (buffer, buflen, 0x00C5, &n);
-  if (!fpr || n != 60)
+  if (!fpr || n < 60)
     {
       xfree (buffer);
       log_error (_("error reading fingerprint DO\n"));
@@ -5629,7 +5777,7 @@ parse_historical (struct app_local_s *apploc,
  * The constant string is not allocated dynamically, never free it.
  */
 static const char *
-ecc_curve (unsigned char *buf, size_t buflen)
+ecc_curve (const unsigned char *buf, size_t buflen)
 {
   gcry_mpi_t oid;
   char *oidstr;
@@ -5657,6 +5805,39 @@ ecc_curve (unsigned char *buf, size_t buflen)
   result = openpgp_oid_to_curve (oidstr, 1);
   xfree (oidstr);
   return result;
+}
+
+
+static const char *
+get_algorithm_attribute_string (const unsigned char *buffer,
+                                size_t buflen)
+{
+  enum gcry_pk_algos galgo;
+  const char *curve;
+  unsigned int nbits = 0;
+
+  galgo = map_openpgp_pk_to_gcry (*buffer);
+  nbits = 0;
+  curve = NULL;
+
+  if (*buffer == PUBKEY_ALGO_RSA && (buflen == 5 || buflen == 6))
+    nbits = (buffer[1]<<8 | buffer[2]);
+  else if (*buffer == PUBKEY_ALGO_ECDH || *buffer == PUBKEY_ALGO_ECDSA
+           || *buffer == PUBKEY_ALGO_EDDSA)
+    {
+      int oidlen = buflen - 1;
+
+      if (buffer[buflen-1] == 0x00 || buffer[buflen-1] == 0xff)
+        { /* Found "pubkey required"-byte for private key template.  */
+          oidlen--;
+        }
+
+      curve = ecc_curve (buffer + 1, oidlen);
+    }
+  else if (opt.verbose)
+    log_printhex (buffer, buflen, "");
+
+  return get_keyalgo_string (galgo, nbits, curve);
 }
 
 

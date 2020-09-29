@@ -1955,14 +1955,13 @@ ssh_key_to_blob (gcry_sexp_t sexp, int with_secret,
 	}
       if ((key_spec.flags & SPEC_FLAG_IS_EdDSA))
         {
-
           data = gcry_sexp_nth_data (value_pair, 1, &datalen);
           if (!data)
             {
               err = gpg_error (GPG_ERR_INV_SEXP);
               goto out;
             }
-          if (*p_elems == 'q' && datalen)
+          if (*p_elems == 'q' && (datalen & 1) && *data == 0x40)
             { /* Remove the prefix 0x40.  */
               data++;
               datalen--;
@@ -2123,6 +2122,10 @@ ssh_receive_key (estream_t stream, gcry_sexp_t *key_new, int secret,
        * we only want the real 32 byte private key - Libgcrypt expects
        * this.
        */
+
+      /* For now, it's only Ed25519.  In future, Ed448 will come.  */
+      curve_name = "Ed25519";
+
       mpi_list = xtrycalloc (3, sizeof *mpi_list);
       if (!mpi_list)
         {
@@ -2229,38 +2232,14 @@ ssh_receive_key (estream_t stream, gcry_sexp_t *key_new, int secret,
 	goto out;
     }
 
-  if ((spec.flags & SPEC_FLAG_IS_EdDSA))
+  err = sexp_key_construct (&key, spec, secret, curve_name, mpi_list,
+                            comment? comment:"");
+  if (!err)
     {
-      if (secret)
-        {
-          err = gcry_sexp_build (&key, NULL,
-                                 "(private-key(ecc(curve \"Ed25519\")"
-                                 "(flags eddsa)(q %m)(d %m))"
-                                 "(comment%s))",
-                                 mpi_list[0], mpi_list[1],
-                                 comment? comment:"");
-        }
-      else
-        {
-          err = gcry_sexp_build (&key, NULL,
-                                 "(public-key(ecc(curve \"Ed25519\")"
-                                 "(flags eddsa)(q %m))"
-                                 "(comment%s))",
-                                 mpi_list[0],
-                                 comment? comment:"");
-        }
+      if (key_spec)
+        *key_spec = spec;
+      *key_new = key;
     }
-  else
-    {
-      err = sexp_key_construct (&key, spec, secret, curve_name, mpi_list,
-                                comment? comment:"");
-      if (err)
-        goto out;
-    }
-
-  if (key_spec)
-    *key_spec = spec;
-  *key_new = key;
 
  out:
   es_fclose (cert);
@@ -2497,7 +2476,7 @@ ssh_handler_request_identities (ctrl_t ctrl,
      reader - this should be allowed even without being listed in
      sshcontrol. */
 
-  if (!opt.disable_scdaemon)
+  if (!opt.disable_daemon[DAEMON_SCD])
     {
       char *serialno;
       struct card_key_info_s *keyinfo_list;
@@ -2809,6 +2788,9 @@ ssh_handler_sign_request (ctrl_t ctrl, estream_t request, estream_t response)
   if (!hash_algo)
     hash_algo = GCRY_MD_SHA1;  /* Use the default.  */
   ctrl->digest.algo = hash_algo;
+  xfree (ctrl->digest.data);
+  ctrl->digest.data = NULL;
+  ctrl->digest.is_pss = 0;
   if ((spec.flags & SPEC_FLAG_USE_PKCS1V2))
     ctrl->digest.raw_value = 0;
   else
@@ -3054,8 +3036,10 @@ ssh_identity_register (ctrl_t ctrl, ssh_key_type_spec_t *spec,
   if (err)
     goto out;
 
-  /* Store this key to our key storage.  */
-  err = agent_write_private_key (key_grip_raw, buffer, buffer_n, 0, NULL, NULL);
+  /* Store this key to our key storage.  We do not store a creation
+   * timestamp because we simply do not know.  */
+  err = agent_write_private_key (key_grip_raw, buffer, buffer_n, 0,
+                                 NULL, NULL, 0);
   if (err)
     goto out;
 
@@ -3629,8 +3613,8 @@ start_command_handler_ssh (ctrl_t ctrl, gnupg_fd_t sock_client)
       es_ungetc (c, stream_sock);
     }
 
-  /* Reset the SCD in case it has been used. */
-  agent_reset_scd (ctrl);
+  /* Reset the daemon in case it has been used. */
+  agent_reset_daemon (ctrl);
 
 
  out:
@@ -3777,8 +3761,8 @@ serve_mmapped_ssh_request (ctrl_t ctrl,
       valid_response = 1;
     }
 
-  /* Reset the SCD in case it has been used. */
-  agent_reset_scd (ctrl);
+  /* Reset the daemon in case it has been used. */
+  agent_reset_daemon (ctrl);
 
   return valid_response? 0 : -1;
 }

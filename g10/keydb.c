@@ -487,15 +487,11 @@ keydb_search_desc_dump (struct keydb_search_desc *desc)
     case KEYDB_SEARCH_MODE_ISSUER:
       return xasprintf ("ISSUER: '%s'", desc->u.name);
     case KEYDB_SEARCH_MODE_ISSUER_SN:
-      return xasprintf ("ISSUER_SN: '%*s'",
-                        (int) (desc->snlen == -1
-                               ? strlen (desc->sn) : desc->snlen),
-                        desc->sn);
+      return xasprintf ("ISSUER_SN: '#%.*s/%s'",
+                        (int)desc->snlen,desc->sn, desc->u.name);
     case KEYDB_SEARCH_MODE_SN:
-      return xasprintf ("SN: '%*s'",
-                        (int) (desc->snlen == -1
-                               ? strlen (desc->sn) : desc->snlen),
-                        desc->sn);
+      return xasprintf ("SN: '%.*s'",
+                        (int)desc->snlen, desc->sn);
     case KEYDB_SEARCH_MODE_SUBJECT:
       return xasprintf ("SUBJECT: '%s'", desc->u.name);
     case KEYDB_SEARCH_MODE_KEYGRIP:
@@ -1136,8 +1132,9 @@ keydb_pop_found_state (KEYDB_HANDLE hd)
 
 
 
-static gpg_error_t
-parse_keyblock_image (iobuf_t iobuf, int pk_no, int uid_no,
+/* Parse the keyblock in IOBUF and return at R_KEYBLOCK.  */
+gpg_error_t
+keydb_parse_keyblock (iobuf_t iobuf, int pk_no, int uid_no,
                       kbnode_t *r_keyblock)
 {
   gpg_error_t err;
@@ -1300,7 +1297,7 @@ internal_keydb_get_keyblock (KEYDB_HANDLE hd, KBNODE *ret_kb)
 	}
       else
 	{
-	  err = parse_keyblock_image (hd->keyblock_cache.iobuf,
+	  err = keydb_parse_keyblock (hd->keyblock_cache.iobuf,
 				      hd->keyblock_cache.pk_no,
 				      hd->keyblock_cache.uid_no,
 				      ret_kb);
@@ -1332,7 +1329,7 @@ internal_keydb_get_keyblock (KEYDB_HANDLE hd, KBNODE *ret_kb)
                                    &iobuf, &pk_no, &uid_no);
         if (!err)
           {
-            err = parse_keyblock_image (iobuf, pk_no, uid_no, ret_kb);
+            err = keydb_parse_keyblock (iobuf, pk_no, uid_no, ret_kb);
             if (!err && hd->keyblock_cache.state == KEYBLOCK_CACHE_PREPARED)
               {
                 hd->keyblock_cache.state     = KEYBLOCK_CACHE_FILLED;
